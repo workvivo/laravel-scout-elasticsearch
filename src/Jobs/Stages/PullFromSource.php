@@ -51,9 +51,19 @@ final class PullFromSource
     {
         /** @var Searchable $searchable */
         $softDelete = config('scout.soft_delete', false);
+
+        $searchableRelations = null;
+
+        if (method_exists($searchable, 'searchableRelations')) {
+            $searchableRelations = $searchable->searchableRelations();
+        }
+
         $query = $searchable->newQuery()
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
+            })
+            ->when($searchableRelations, function ($query) use ($searchableRelations) {
+                return $query->with($searchableRelations);
             })
             ->orderBy($searchable->getKeyName());
         $totalSearchables = $query->count();
