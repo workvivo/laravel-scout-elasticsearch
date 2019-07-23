@@ -7,6 +7,7 @@ use ONGR\ElasticsearchDSL\Search;
 use ONGR\ElasticsearchDSL\Sort\FieldSort;
 use ONGR\ElasticsearchDSL\Query\Compound\BoolQuery;
 use ONGR\ElasticsearchDSL\Query\TermLevel\TermQuery;
+use ONGR\ElasticsearchDSL\Query\TermLevel\TermsQuery;
 use ONGR\ElasticsearchDSL\Query\FullText\QueryStringQuery;
 
 final class SearchFactory
@@ -20,10 +21,14 @@ final class SearchFactory
     {
         $search = new Search();
         $query = new QueryStringQuery($builder->query);
-        if (! empty($builder->wheres)) {
+        if (!empty($builder->wheres)) {
             $boolQuery = new BoolQuery();
             foreach ($builder->wheres as $field => $value) {
-                $boolQuery->add(new TermQuery((string) $field, $value), BoolQuery::FILTER);
+                if (is_array($value)) {
+                    $boolQuery->add(new TermsQuery((string) $field, $value), BoolQuery::FILTER);
+                } else {
+                    $boolQuery->add(new TermQuery((string) $field, $value), BoolQuery::FILTER);
+                }
             }
             $boolQuery->add($query, BoolQuery::MUST);
             $search->addQuery($boolQuery);
@@ -36,7 +41,7 @@ final class SearchFactory
         if (array_key_exists('size', $options)) {
             $search->setSize($options['size']);
         }
-        if (! empty($builder->orders)) {
+        if (!empty($builder->orders)) {
             foreach ($builder->orders as $order) {
                 $search->addSort(new FieldSort($order['column'], $order['direction']));
             }
