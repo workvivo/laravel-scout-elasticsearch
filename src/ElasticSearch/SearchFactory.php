@@ -25,9 +25,11 @@ final class SearchFactory
             $boolQuery = new BoolQuery();
             foreach ($builder->wheres as $field => $value) {
                 if (is_array($value)) {
-                    $boolQuery->add(new TermsQuery((string) $field, $value), BoolQuery::FILTER);
+                    $boolQuery->add(new TermsQuery((string) $field, $value), BoolQuery::SHOULD);
+                    // $boolQuery->add($query, BoolQuery::SHOULD);
                 } else {
                     $boolQuery->add(new TermQuery((string) $field, $value), BoolQuery::FILTER);
+                    // $boolQuery->add($query, BoolQuery::MUST);
                 }
             }
             $boolQuery->add($query, BoolQuery::MUST);
