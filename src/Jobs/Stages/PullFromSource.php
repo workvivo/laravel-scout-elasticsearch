@@ -53,22 +53,31 @@ final class PullFromSource
         $softDelete = config('scout.soft_delete', false);
 
         $searchableRelations = null;
+        $searchableCountRelations = null;
 
         if (method_exists($searchable, 'searchableRelations')) {
             $searchableRelations = $searchable->searchableRelations();
         }
+        if (method_exists($searchable, 'searchableCountRelations')) {
+            $searchableCountRelations = $searchable->searchableCountRelations();
+        }
 
-        $query = $searchable->newQuery()
+        $query = $searchable->newQuery()->setEagerLoads([])
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
             })
             ->when($searchableRelations, function ($query) use ($searchableRelations) {
                 return $query->with($searchableRelations);
             })
+            ->when($searchableCountRelations, function ($query) use ($searchableCountRelations) {
+                return $query->withCount($searchableCountRelations);
+            })
             ->orderBy($searchable->getKeyName());
+
         $totalSearchables = $query->count();
         if ($totalSearchables) {
             $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
+
             $totalChunks = (int) ceil($totalSearchables / $chunkSize);
 
             return collect(range(1, $totalChunks))->map(function ($page) use ($query, $chunkSize) {

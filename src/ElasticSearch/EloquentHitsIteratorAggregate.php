@@ -56,9 +56,11 @@ final class EloquentHitsIteratorAggregate implements \IteratorAggregate
                         $builder->query($this->callback);
                     }
                     /* @var Searchable $model */
-                    return $models = $model->getScoutModelsByIds(
+                    $models = $model->getScoutModelsByIds(
                         $builder, $results->pluck('_id')->all()
                     );
+
+                    return $models;
                 })
                 ->flatten()->keyBy(function ($model) {
                     return get_class($model).'::'.$model->getScoutKey();
