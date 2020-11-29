@@ -62,7 +62,7 @@ final class PullFromSource
             $searchableCountRelations = $searchable->searchableCountRelations();
         }
 
-        $query = $searchable->newQuery()->setEagerLoads([])
+        $query = $searchable->newQuery()->setEagerLoads([])->withoutGlobalScopes()
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
             })
