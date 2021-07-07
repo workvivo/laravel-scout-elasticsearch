@@ -70,6 +70,7 @@ final class EloquentHitsIteratorAggregate implements \IteratorAggregate
 
                 return isset($models[$key]) ? $models[$key] : null;
             })->filter()->all();
+            $hits = array_values($hits);
         }
 
         return new \ArrayIterator($hits);
