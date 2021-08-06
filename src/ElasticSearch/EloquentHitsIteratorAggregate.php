@@ -34,6 +34,7 @@ final class EloquentHitsIteratorAggregate implements \IteratorAggregate
     {
         $this->results = $results;
         $this->callback = $callback;
+        $this->unsetFound = false;
     }
 
     /**
@@ -65,11 +66,21 @@ final class EloquentHitsIteratorAggregate implements \IteratorAggregate
                 ->flatten()->keyBy(function ($model) {
                     return get_class($model).'::'.$model->getScoutKey();
                 });
-            $hits = collect($hits)->map(function ($hit) use ($models) {
+            
+                $hits = collect($hits)->map(function ($hit) use ($models) {
                 $key = $hit['_source']['__class_name'].'::'.$hit['_id'];
 
-                return isset($models[$key]) ? $models[$key] : null;
+                if (isset($models[$key])) {
+                    return $models[$key];
+                } else {
+                    $this->unsetFound = true;
+                    return null;
+                }
             })->filter()->all();
+            
+            if ($this->unsetFound === true) {
+                $hits = array_values($hits);
+            }
         }
 
         return new \ArrayIterator($hits);
