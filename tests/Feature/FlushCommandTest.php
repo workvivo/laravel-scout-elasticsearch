@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace Tests\Feature;
 
 use App\Product;
-use Tests\IntegrationTestCase;
 use Illuminate\Support\Facades\Artisan;
 use Matchish\ScoutElasticSearch\ElasticSearch\Params\Bulk;
 use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Refresh;
+use Tests\IntegrationTestCase;
 
 final class FlushCommandTest extends IntegrationTestCase
 {
@@ -38,6 +38,6 @@ final class FlushCommandTest extends IntegrationTestCase
         ];
 
         $response = $this->elasticsearch->search($params);
-        $this->assertEquals(0, $response['hits']['total']);
+        $this->assertEquals(0, $response['hits']['total']['value']);
     }
 }

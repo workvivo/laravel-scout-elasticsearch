@@ -3,12 +3,11 @@
 namespace Tests\Unit\Engines;
 
 use App\Product;
-use Mockery as m;
-use Tests\TestCase;
 use Elasticsearch\Client;
 use Laravel\Scout\Builder;
-use ONGR\ElasticsearchDSL\Search;
 use Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine;
+use Mockery as m;
+use Tests\TestCase;
 
 class ElasticSearchEngineTest extends TestCase
 {
@@ -36,10 +35,10 @@ class ElasticSearchEngineTest extends TestCase
     {
         $client = m::mock(Client::class);
         $engine = new ElasticSearchEngine($client);
-        $client->shouldReceive('search')->once()->with(m::type(Search::class));
+        $client->shouldReceive('search')->once()->with(m::type('array'));
         $query = 'zonda';
         $builder = new Builder(new Product(), $query, function ($client, $query) {
-            return $client->search($query);
+            return $client->search($query->toArray());
         });
         $engine->search($builder);
     }
@@ -59,12 +58,12 @@ class ElasticSearchEngineTest extends TestCase
                 'hits' => [
                     [
                         '_id' => 1, '_source' => [
-                        '__class_name' => Product::class,
-                    ], ],
+                            '__class_name' => Product::class,
+                        ], ],
                     [
                         '_id' => 2, '_source' => [
-                        '__class_name' => Product::class,
-                    ], ],
+                            '__class_name' => Product::class,
+                        ], ],
                 ],
                 'total' => 2,
             ], ], new Product());

@@ -2,11 +2,14 @@
 
 namespace Tests\Integration\Engines;
 
-use stdClass;
 use App\Product;
 use Laravel\Scout\Builder;
-use Tests\IntegrationTestCase;
+use Matchish\ScoutElasticSearch\ElasticSearch\Index;
+use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Create;
 use Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine;
+use Matchish\ScoutElasticSearch\Searchable\DefaultImportSourceFactory;
+use stdClass;
+use Tests\IntegrationTestCase;
 
 final class ElasticSearchEngineTest extends IntegrationTestCase
 {
@@ -49,10 +52,28 @@ final class ElasticSearchEngineTest extends IntegrationTestCase
             ],
         ];
         $response = $this->elasticsearch->search($params);
-        $this->assertEquals($models->count(), $response['hits']['total']);
+        $this->assertEquals($models->count(), $response['hits']['total']['value']);
         foreach ($response['hits']['hits'] as $doc) {
             $this->assertEquals('Scout', $doc['_source']['title']);
         }
+    }
+
+    public function test_update_throw_exception_on_elasticsearch_error()
+    {
+        $this->expectException(\Exception::class);
+        $models = Product::all();
+        $models->map(function ($model) {
+            $model->price = 'bad format';
+
+            return $model;
+        });
+        $index = Index::fromSource(DefaultImportSourceFactory::from(Product::class));
+        $params = new Create(
+            'products',
+            $index->config()
+        );
+        $this->elasticsearch->indices()->create($params->toArray());
+        $this->engine->update($models);
     }
 
     public function test_delete()
@@ -72,7 +93,7 @@ final class ElasticSearchEngineTest extends IntegrationTestCase
             ],
         ];
         $response = $this->elasticsearch->search($params);
-        $this->assertEquals(1, $response['hits']['total']);
+        $this->assertEquals(1, $response['hits']['total']['value']);
         foreach ($response['hits']['hits'] as $doc) {
             $this->assertEquals($shouldBeNotDeleted->getScoutKey(), $doc['_id']);
         }
@@ -94,7 +115,7 @@ final class ElasticSearchEngineTest extends IntegrationTestCase
             ],
         ];
         $response = $this->elasticsearch->search($params);
-        $this->assertEquals(0, $response['hits']['total']);
+        $this->assertEquals(0, $response['hits']['total']['value']);
     }
 
     public function test_map_with_custom_key_name()
