@@ -25,9 +25,13 @@ final class PullFromSource
 
     public function handle(): void
     {
+        echo 'PullFromSource 28: '.date('h:i:s.u')."\n";
         $results = $this->source->get()->filter->shouldBeSearchable();
+        echo 'PullFromSource 30: '.date('h:i:s.u')."\n";
         if (! $results->isEmpty()) {
+            echo 'PullFromSource 32: '.date('h:i:s.u')."\n";
             $results->first()->searchableUsing()->update($results);
+            echo 'PullFromSource 34: '.date('h:i:s.u')."\n";
         }
     }
 
@@ -47,8 +51,11 @@ final class PullFromSource
      */
     public static function chunked(ImportSource $source): Collection
     {
+        echo 'PullFromSource 54: '.date('h:i:s.u')."\n";
+
         return $source->chunked()->map(function ($chunk) {
             return new static($chunk);
         });
+        echo 'PullFromSource 59: '.date('h:i:s.u')."\n";
     }
 }
