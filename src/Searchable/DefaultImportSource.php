@@ -118,7 +118,7 @@ final class DefaultImportSource implements ImportSource
             $searchableCountRelations = $this->searchableCountRelations();
         }
 
-        if (method_exists($searchable, 'searchableRelations')) {
+        if (method_exists($this, 'searchableRelations')) {
             $searchableRelations = $searchable->searchableRelations();
         }
 
