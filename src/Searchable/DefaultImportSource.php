@@ -119,7 +119,7 @@ final class DefaultImportSource implements ImportSource
         }
 
         if (method_exists($this, 'searchableRelations')) {
-            $searchableRelations = $searchable->searchableRelations();
+            $searchableRelations = $this->searchableRelations();
         }
 
         $query
