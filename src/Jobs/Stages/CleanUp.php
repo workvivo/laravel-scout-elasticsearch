@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
 use Elasticsearch\Client;
@@ -37,7 +39,7 @@ final class CleanUp
             $response = [];
         }
         foreach ($response as $indexName => $data) {
-            foreach ($data['aliases'] as $alias => $config) {
+            foreach ($data['aliases'] as $config) {
                 if (array_key_exists('is_write_index', $config) && $config['is_write_index']) {
                     $params = new DeleteIndexParams((string) $indexName);
                     $elasticsearch->indices()->delete($params->toArray());
@@ -47,13 +49,8 @@ final class CleanUp
         }
     }
 
-    public function title(): string
+    protected function getDisplayName(): string
     {
         return 'Clean up';
-    }
-
-    public function estimate(): int
-    {
-        return 1;
     }
 }

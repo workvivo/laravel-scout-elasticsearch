@@ -1,9 +1,14 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
+use Illuminate\Bus\Queueable;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\LazyCollection;
+use Imtigger\LaravelJobStatus\Trackable;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
 /**
@@ -11,35 +16,31 @@ use Matchish\ScoutElasticSearch\Searchable\ImportSource;
  */
 final class PullFromSource
 {
-    /**
-     * @var ImportSource
-     */
-    private $source;
+    use Queueable;
+    private Collection $source;
 
-    /**
-     * @param ImportSource $source
-     */
-    public function __construct(ImportSource $source)
+    public function __construct(Collection $source)
     {
         $this->source = $source;
     }
 
     public function handle(): void
     {
-        echo 'PullFromSource 28: '.date('h:i:s.u')."\n";
-        $results = $this->source->get()->filter->shouldBeSearchable();
-        echo 'PullFromSource 30: '.date('h:i:s.u')."\n";
-        if (! $results->isEmpty()) {
-            Cache::put('scout_import_last_id', $results->last()->getKey());
-            echo 'PullFromSource 32: '.date('h:i:s.u')."\n";
-            $results->first()->searchableUsing()->update($results);
+        echo 'PullFromSource 31: '.date('h:i:s.u')."\n";
+        $this->source->each(function ($chunk) {
+            $results = $chunk->get()->filter->shouldBeSearchable();
             echo 'PullFromSource 34: '.date('h:i:s.u')."\n";
-        }
+            if (! $results->isEmpty()) {
+                echo 'PullFromSource 36: '.date('h:i:s.u')."\n";
+                $results->first()->searchableUsing()->update($results);
+                echo 'PullFromSource 38: '.date('h:i:s.u')."\n";
+            }
+        });
     }
 
     public function estimate(): int
     {
-        return 1;
+        return $this->source->count();
     }
 
     public function title(): string
@@ -49,15 +50,14 @@ final class PullFromSource
 
     /**
      * @param ImportSource $source
-     * @return Collection
+     * @return LazyCollection
      */
-    public static function chunked(ImportSource $source): Collection
+    public static function chunked(ImportSource $source): LazyCollection
     {
-        echo 'PullFromSource 54: '.date('h:i:s.u')."\n";
-
-        return $source->chunked()->map(function ($chunk) {
-            return new static($chunk);
-        });
         echo 'PullFromSource 59: '.date('h:i:s.u')."\n";
+
+        return $source->chunked()->map(function ($chunks) {
+            return new self($chunks);
+        });
     }
 }

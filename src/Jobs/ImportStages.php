@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Jobs;
 
 use Illuminate\Support\Collection;
@@ -22,13 +24,13 @@ class ImportStages extends Collection
     {
         $index = Index::fromSource($source);
 
-        return (new self([
+        return [self::make([
             new CleanUp($source),
             new CreateWriteIndex($source, $index),
             new CleanLastId(), // Cleans the last ID of the cache left over from the last time
             PullFromSource::chunked($source),
             new RefreshIndex($index),
             new SwitchToNewAndRemoveOldIndex($source, $index),
-        ]))->flatten()->filter();
+        ]), $source->chunksCount() + 4];
     }
 }
