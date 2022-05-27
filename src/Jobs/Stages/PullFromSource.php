@@ -3,6 +3,7 @@
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
 /**
@@ -29,6 +30,7 @@ final class PullFromSource
         $results = $this->source->get()->filter->shouldBeSearchable();
         echo 'PullFromSource 30: '.date('h:i:s.u')."\n";
         if (! $results->isEmpty()) {
+            Cache::put('scout_import_last_id', $results->last()->getKey());
             echo 'PullFromSource 32: '.date('h:i:s.u')."\n";
             $results->first()->searchableUsing()->update($results);
             echo 'PullFromSource 34: '.date('h:i:s.u')."\n";
