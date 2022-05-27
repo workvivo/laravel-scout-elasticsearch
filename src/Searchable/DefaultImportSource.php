@@ -112,16 +112,25 @@ final class DefaultImportSource implements ImportSource
         $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
 
         $searchableCountRelations = null;
+        $searchableRelations = null;
 
         if (method_exists($this, 'searchableCountRelations')) {
             $searchableCountRelations = $this->searchableCountRelations();
         }
+
+        if (method_exists($searchable, 'searchableRelations')) {
+            $searchableRelations = $searchable->searchableRelations();
+        }
+
         $query
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
             })
             ->when($searchableCountRelations, function ($query) use ($searchableCountRelations) {
                 return $query->withCount($searchableCountRelations);
+            })
+            ->when($searchableRelations, function ($query) use ($searchableRelations) {
+                return $query->with($searchableRelations);
             })
             ->orderBy($this->model()->getKeyName());
 
