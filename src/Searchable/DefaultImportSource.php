@@ -57,11 +57,7 @@ final class DefaultImportSource implements ImportSource
     public function syncWithSearchUsingQueues(): array
     {
         return [
-            'import-1',
-            'import-2',
-            'import-3',
-            'import-4',
-            'import-5',
+            env('AWS_SQS_QUEUE'),
         ];
     }
 
@@ -72,8 +68,6 @@ final class DefaultImportSource implements ImportSource
 
     public function chunked(): LazyCollection
     {
-        echo 'DefaultImportSource 75: '.date('h:i:s.u')."\n";
-
         return LazyCollection::make(function () {
             $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
             $workers = (int) config('scout.chunk.handlers', self::DEFAULT_CHUNK_HANDLERS);
@@ -114,8 +108,6 @@ final class DefaultImportSource implements ImportSource
 
     private function newQuery(): Builder
     {
-        echo 'DefaultImportSource 81: '.date('h:i:s.u')."\n";
-
         $query = $this->model()->newQuery()->setEagerLoads([])->withoutGlobalScopes();
         $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
 
@@ -124,7 +116,6 @@ final class DefaultImportSource implements ImportSource
         if (method_exists($this, 'searchableCountRelations')) {
             $searchableCountRelations = $this->searchableCountRelations();
         }
-        echo 'DefaultImportSource 91: '.date('h:i:s.u')."\n";
         $query
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
@@ -133,7 +124,6 @@ final class DefaultImportSource implements ImportSource
                 return $query->withCount($searchableCountRelations);
             })
             ->orderBy($this->model()->getKeyName());
-        echo 'DefaultImportSource 100: '.date('h:i:s.u')."\n";
 
         $scopes = $this->scopes;
 
@@ -146,7 +136,6 @@ final class DefaultImportSource implements ImportSource
 
     public function get(): EloquentCollection
     {
-        echo 'DefaultImportSource 113: '.date('h:i:s.u')."\n";
         /** @var EloquentCollection $models */
         $models = $this->newQuery()->get();
         $this->last = $models->last();
