@@ -15,6 +15,9 @@
   </p>
 </p>
 
+#### For PHP8 support use [php8](https://github.com/matchish/laravel-scout-elasticsearch/tree/php8) branch  
+#### For Laravel Framework < 6.0.0 use [3.x](https://github.com/matchish/laravel-scout-elasticsearch/tree/3.x) branch
+
 The package provides the perfect starting point to integrate
 ElasticSearch into your Laravel application. It is carefully crafted to simplify the usage
 of ElasticSearch within the [Laravel Framework](https://laravel.com).
@@ -25,20 +28,26 @@ great features, and at the same time leverage the complete set of ElasticSearch�
 
 If you need any help, [stack overflow](https://stackoverflow.com/questions/tagged/laravel-scout%20laravel%20elasticsearch) is the preferred and recommended way to ask support questions.
 
-## :two_hearts: Features
+## :two_hearts: Features  
+Don't forget to :star: the package if you like it. :pray:
 
+- Laravel Scout 8.x support
 - [Search amongst multiple models](#search-amongst-multiple-models)
 - [**Zero downtime** reimport](#zero-downtime-reimport) - it’s a breeze to import data in production.
-- Elasticsearch **7.0** ready - Use [elasticsearch-7](https://github.com/matchish/laravel-scout-elasticsearch/tree/elasticsearch-7) branch instead.
+- [Eager load relations](#eager-load) - speed up your import.
 - Import all searchable models at once.
 - A fully configurable mapping for each model.
 - Full power of ElasticSearch in your queries.
 
 ## :warning: Requirements
 
-- PHP version >= 7.1.3
-- Laravel Framework version >= 5.6
-- Elasticsearch version >= 6
+- PHP version >= 7.3
+- Laravel Framework version >= 6.0.0
+
+| Elasticsearch version | ElasticsearchDSL version    |
+| --------------------- | --------------------------- |
+| >= 7.0                | >= 3.0.0                    |
+| >= 6.0, < 7.0         | < 3.0.0                     |
 
 ## :rocket: Installation
 
@@ -56,7 +65,7 @@ so feel free do it in your app service provider.
 But if you don't want to do it right now, 
 you can use `Matchish\ElasticSearchServiceProvider` from the package.  
 Register the provider, adding to `config/app.php`
-```
+```php
 'providers' => [
     // Other Service Providers
 
@@ -72,7 +81,7 @@ And publish config example for elasticsearch
 
 ## :bulb: Usage
 
-> **Note:** This package adds functionalities to [Laravel Scout](https://github.com/laravel/scout), and for this reason, we encourage you to **read the Scout documentation first**. Documentation for Scout can be found on the [Laravel website](https://github.com/laravel/scout).
+> **Note:** This package adds functionalities to [Laravel Scout](https://github.com/laravel/scout), and for this reason, we encourage you to **read the Scout documentation first**. Documentation for Scout can be found on the [Laravel website](https://laravel.com/docs/scout).
 
 ### Index [settings](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-create-index.html#create-index-settings) and [mappings](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-create-index.html#mappings)
 It is very important to define the mapping when we create an index — an inappropriate preliminary definition and mapping may result in the wrong search results.
@@ -90,11 +99,50 @@ Or you you can specify default mappings with config key
 Same way you can define settings
 
 For index `products` it will be  
-`elasticsearch.indices.settigs.products`  
+`elasticsearch.indices.settings.products`  
 
 And for default settings  
-`elasticsearch.indices.settigs.default`
+`elasticsearch.indices.settings.default`
 
+### Eager load
+To speed up import you can eager load relations on import using global scopes.
+
+You should configure `ImportSourceFactory` in your service provider(`register` method)
+```php
+use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
+...
+public function register(): void
+{
+$this->app->bind(ImportSourceFactory::class, MyImportSourceFactory::class);
+``` 
+Here is an example of `MyImportSourceFactory`
+```php
+namespace Matchish\ScoutElasticSearch\Searchable;
+
+final class MyImportSourceFactory implements ImportSourceFactory
+{
+    public static function from(string $className): ImportSource
+    {
+        //Add all required scopes
+        return new DefaultImportSource($className, [new WithCommentsScope()]);
+    }
+}
+
+class WithCommentsScope implements Scope {
+
+    /**
+     * Apply the scope to a given Eloquent query builder.
+     *
+     * @param \Illuminate\Database\Eloquent\Builder $builder
+     * @param \Illuminate\Database\Eloquent\Model $model
+     * @return void
+     */
+    public function apply(Builder $builder, Model $model)
+    {
+        $builder->with('comments');
+    }
+}
+```
 ### Zero downtime reimport
 While working in production, to keep your existing search experience available while reimporting your data, you also can use `scout:import` Artisan command:  
 
@@ -150,7 +198,11 @@ Mixed::search('title:Barcelona or to:Barcelona')
 In this example you will get collection of `Ticket` and `Book` models where ticket's arrival city or
 book title is `Barcelona`
 
->Don't forget to :star: the package if you like it. :pray:
+### Working with results
+Often your response isn't collection of models but aggregations or models with higlights an so on.
+In this case you need to implement your own implementation of `HitsIteratorAggregate` and bind it in your service provider
+
+[Here is a case](https://github.com/matchish/laravel-scout-elasticsearch/issues/28)
 
 ## :free: License
 Scout ElasticSearch is an open-sourced software licensed under the [MIT license](LICENSE.md).

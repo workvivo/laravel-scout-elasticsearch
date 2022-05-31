@@ -5,12 +5,14 @@ declare(strict_types=1);
 namespace Matchish\ScoutElasticSearch;
 
 use Elasticsearch\Client;
-use Laravel\Scout\EngineManager;
 use Illuminate\Support\ServiceProvider;
+use Laravel\Scout\EngineManager;
 use Laravel\Scout\ScoutServiceProvider;
-use Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine;
 use Matchish\ScoutElasticSearch\Console\Commands\FlushCommand;
 use Matchish\ScoutElasticSearch\Console\Commands\ImportCommand;
+use Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine;
+use Matchish\ScoutElasticSearch\Searchable\DefaultImportSourceFactory;
+use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 
 final class ScoutElasticSearchServiceProvider extends ServiceProvider
 {
@@ -21,11 +23,12 @@ final class ScoutElasticSearchServiceProvider extends ServiceProvider
     {
         $this->loadTranslationsFrom(__DIR__.'/../resources/lang', 'scout');
 
-        resolve(EngineManager::class)->extend(ElasticSearchEngine::class, function () {
-            $elasticsearch = resolve(Client::class);
+        $this->app->make(EngineManager::class)->extend(ElasticSearchEngine::class, function () {
+            $elasticsearch = app(Client::class);
 
             return new ElasticSearchEngine($elasticsearch);
         });
+        $this->registerCommands();
     }
 
     /**
@@ -34,8 +37,7 @@ final class ScoutElasticSearchServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->register(ScoutServiceProvider::class);
-
-        $this->registerCommands();
+        $this->app->bind(ImportSourceFactory::class, DefaultImportSourceFactory::class);
     }
 
     /**

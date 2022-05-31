@@ -1,13 +1,14 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
 use Elasticsearch\Client;
-use Laravel\Scout\Searchable;
-use Illuminate\Database\Eloquent\Model;
 use Elasticsearch\Common\Exceptions\Missing404Exception;
 use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Alias\Get as GetAliasParams;
 use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Delete as DeleteIndexParams;
+use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
 /**
  * @internal
@@ -15,30 +16,30 @@ use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Delete as DeleteInd
 final class CleanUp
 {
     /**
-     * @var Model
+     * @var ImportSource
      */
-    private $searchable;
+    private $source;
 
     /**
-     * @param Model $searchable
+     * @param ImportSource $source
      */
-    public function __construct(Model $searchable)
+    public function __construct(ImportSource $source)
     {
-        $this->searchable = $searchable;
+        $this->source = $source;
     }
 
     public function handle(Client $elasticsearch): void
     {
-        /** @var Searchable $searchable */
-        $searchable = $this->searchable;
-        $params = GetAliasParams::anyIndex($searchable->searchableAs());
+        $source = $this->source;
+        $params = GetAliasParams::anyIndex($source->searchableAs());
         try {
-            $response = $elasticsearch->indices()->getAliases($params->toArray());
+            /** @var array $response */
+            $response = $elasticsearch->indices()->getAlias($params->toArray());
         } catch (Missing404Exception $e) {
             $response = [];
         }
         foreach ($response as $indexName => $data) {
-            foreach ($data['aliases'] as $alias => $config) {
+            foreach ($data['aliases'] as $config) {
                 if (array_key_exists('is_write_index', $config) && $config['is_write_index']) {
                     $params = new DeleteIndexParams((string) $indexName);
                     $elasticsearch->indices()->delete($params->toArray());
@@ -48,13 +49,8 @@ final class CleanUp
         }
     }
 
-    public function title(): string
+    protected function getDisplayName(): string
     {
         return 'Clean up';
-    }
-
-    public function estimate(): int
-    {
-        return 1;
     }
 }

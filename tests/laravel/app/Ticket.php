@@ -2,7 +2,7 @@
 
 namespace App;
 
-use Laravel\Scout\Searchable;
+use App\Traits\Searchable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 

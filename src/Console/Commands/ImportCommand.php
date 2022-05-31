@@ -5,33 +5,35 @@ declare(strict_types=1);
 namespace Matchish\ScoutElasticSearch\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Support\Collection;
 use Matchish\ScoutElasticSearch\Jobs\Import;
-use Matchish\ScoutElasticSearch\Jobs\QueueableJob;
+use Matchish\ScoutElasticSearch\Jobs\TrackableJob;
+use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
 
 final class ImportCommand extends Command
 {
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $signature = 'scout:import {searchable?* : The name of the searchable}';
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $description = 'Create new index and import all searchable into the one';
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function handle(): void
     {
-        $this->searchableList($this->argument('searchable'))
+        $this->searchableList((array) $this->argument('searchable'))
         ->each(function ($searchable) {
             $this->import($searchable);
         });
     }
 
-    private function searchableList($argument)
+    private function searchableList(array $argument): Collection
     {
         return collect($argument)->whenEmpty(function () {
             $factory = new SearchableListFactory(app()->getNamespace(), app()->path());
@@ -40,12 +42,15 @@ final class ImportCommand extends Command
         });
     }
 
-    private function import($searchable)
+    private function import(string $searchable): void
     {
-        $job = new Import($searchable);
+        $sourceFactory = app(ImportSourceFactory::class);
+        $source = $sourceFactory::from($searchable);
+        $job = new Import($source);
+        $progressbar = (new ProgressBarFactory($this->output))->create();
 
         if (config('scout.queue')) {
-            $job = (new QueueableJob())->chain([$job]);
+            $job = (new TrackableJob())->chain([$job]);
         }
 
         $bar = (new ProgressBarFactory($this->output))->create();
@@ -54,10 +59,18 @@ final class ImportCommand extends Command
         $startMessage = trans('scout::import.start', ['searchable' => "<comment>$searchable</comment>"]);
         $this->line($startMessage);
 
-        dispatch($job)->allOnQueue((new $searchable)->syncWithSearchUsingQueue())
-            ->allOnConnection(config((new $searchable)->syncWithSearchUsing()));
+        /* @var ImportSource $source */
+        dispatch($job)->allOnQueue($source->syncWithSearchUsingQueue())
+            ->allOnConnection($source->syncWithSearchUsing());
 
-        $doneMessage = trans(config('scout.queue') ? 'scout::import.done.queue' : 'scout::import.done', [
+        if (config('scout.queue')) {
+            $isQueuedMessage = trans('scout::import.done.queue', [
+                    'searchable' => $searchable,
+                ]);
+            $this->line($isQueuedMessage);
+        }
+
+        $doneMessage = trans('scout::import.done', [
             'searchable' => $searchable,
         ]);
         $this->output->success($doneMessage);
