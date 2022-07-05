@@ -2,35 +2,35 @@
 
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
-use Laravel\Scout\Searchable;
 use Illuminate\Support\Collection;
-use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\Cache;
+use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
 /**
  * @internal
  */
 final class PullFromSource
 {
-    const DEFAULT_CHUNK_SIZE = 500;
+    /**
+     * @var ImportSource
+     */
+    private $source;
 
     /**
-     * @var Builder
+     * @param ImportSource $source
      */
-    private $query;
-
-    /**
-     * @param Builder $query
-     */
-    public function __construct(Builder $query)
+    public function __construct(ImportSource $source)
     {
-        $this->query = $query;
+        $this->source = $source;
     }
 
     public function handle(): void
     {
-        $results = $this->query->get();
-        $results->filter->shouldBeSearchable()->searchable();
+        $results = $this->source->get()->filter->shouldBeSearchable();
+        if (! $results->isEmpty()) {
+            Cache::put('scout_import_last_id', $results->last()->getKey());
+            $results->first()->searchableUsing()->update($results);
+        }
     }
 
     public function estimate(): int
@@ -44,49 +44,13 @@ final class PullFromSource
     }
 
     /**
-     * @param Model $searchable
+     * @param ImportSource $source
      * @return Collection
      */
-    public static function chunked(Model $searchable): Collection
+    public static function chunked(ImportSource $source): Collection
     {
-        /** @var Searchable $searchable */
-        $softDelete = config('scout.soft_delete', false);
-
-        $searchableRelations = null;
-        $searchableCountRelations = null;
-
-        if (method_exists($searchable, 'searchableRelations')) {
-            $searchableRelations = $searchable->searchableRelations();
-        }
-        if (method_exists($searchable, 'searchableCountRelations')) {
-            $searchableCountRelations = $searchable->searchableCountRelations();
-        }
-
-        $query = $searchable->newQuery()->setEagerLoads([])->withoutGlobalScopes()
-            ->when($softDelete, function ($query) {
-                return $query->withTrashed();
-            })
-            ->when($searchableRelations, function ($query) use ($searchableRelations) {
-                return $query->with($searchableRelations);
-            })
-            ->when($searchableCountRelations, function ($query) use ($searchableCountRelations) {
-                return $query->withCount($searchableCountRelations);
-            })
-            ->orderBy($searchable->getKeyName());
-
-        $totalSearchables = $query->count();
-        if ($totalSearchables) {
-            $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
-
-            $totalChunks = (int) ceil($totalSearchables / $chunkSize);
-
-            return collect(range(1, $totalChunks))->map(function ($page) use ($query, $chunkSize) {
-                $clone = (clone $query)->forPage($page, $chunkSize);
-
-                return new static($clone);
-            });
-        } else {
-            return collect();
-        }
+        return $source->chunked()->map(function ($chunk) {
+            return new static($chunk);
+        });
     }
 }

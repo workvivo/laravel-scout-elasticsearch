@@ -3,11 +3,12 @@
 namespace Tests\Integration\Jobs;
 
 use App\Product;
-use Tests\IntegrationTestCase;
 use Illuminate\Console\OutputStyle;
 use Matchish\ScoutElasticSearch\Jobs\Import;
+use Matchish\ScoutElasticSearch\Searchable\DefaultImportSourceFactory;
 use Symfony\Component\Console\Input\ArrayInput;
-use Symfony\Component\Console\Tests\Fixtures\DummyOutput;
+use Tests\Fixtures\DummyOutput;
+use Tests\IntegrationTestCase;
 
 class ImportTest extends IntegrationTestCase
 {
@@ -19,10 +20,13 @@ class ImportTest extends IntegrationTestCase
         factory(Product::class, $productsAmount)->create();
         Product::setEventDispatcher($dispatcher);
 
-        $job = new Import(Product::class);
+        $job = new Import(DefaultImportSourceFactory::from(Product::class));
         $output = new DummyOutput();
         $outputStyle = new OutputStyle(new ArrayInput([]), $output);
         $progressBar = $outputStyle->createProgressBar();
+        $progressBar->setRedrawFrequency(1);
+        $progressBar->maxSecondsBetweenRedraws(0);
+        $progressBar->minSecondsBetweenRedraws(0);
         $progressBar->setFormat('[%message%] %current%/%max%');
         $job->withProgressReport($progressBar);
 

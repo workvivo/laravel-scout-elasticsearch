@@ -2,19 +2,19 @@
 
 namespace Matchish\ScoutElasticSearch\Engines;
 
-use Laravel\Scout\Searchable;
-use Laravel\Scout\Engines\Engine;
-use ONGR\ElasticsearchDSL\Search;
-use Laravel\Scout\Builder as BaseBuilder;
+use Elasticsearch\Common\Exceptions\ServerErrorResponseException;
 use Illuminate\Database\Eloquent\Collection;
-use ONGR\ElasticsearchDSL\Query\MatchAllQuery;
-use Matchish\ScoutElasticSearch\ElasticSearch\Index;
+use Laravel\Scout\Builder;
+use Laravel\Scout\Builder as BaseBuilder;
+use Laravel\Scout\Engines\Engine;
+use Matchish\ScoutElasticSearch\ElasticSearch\HitsIteratorAggregate;
 use Matchish\ScoutElasticSearch\ElasticSearch\Params\Bulk;
+use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Refresh;
+use Matchish\ScoutElasticSearch\ElasticSearch\Params\Search as SearchParams;
 use Matchish\ScoutElasticSearch\ElasticSearch\SearchFactory;
 use Matchish\ScoutElasticSearch\ElasticSearch\SearchResults;
-use Matchish\ScoutElasticSearch\ElasticSearch\Params\Indices\Refresh;
-use Matchish\ScoutElasticSearch\ElasticSearch\EloquentHitsIteratorAggregate;
-use Matchish\ScoutElasticSearch\ElasticSearch\Params\Search as SearchParams;
+use ONGR\ElasticsearchDSL\Query\MatchAllQuery;
+use ONGR\ElasticsearchDSL\Search;
 
 final class ElasticSearchEngine extends Engine
 {
@@ -28,7 +28,7 @@ final class ElasticSearchEngine extends Engine
     /**
      * Create a new engine instance.
      *
-     * @param  \Elasticsearch\Client $elasticsearch
+     * @param \Elasticsearch\Client $elasticsearch
      * @return void
      */
     public function __construct(\Elasticsearch\Client $elasticsearch)
@@ -43,7 +43,11 @@ final class ElasticSearchEngine extends Engine
     {
         $params = new Bulk();
         $params->index($models);
-        $this->elasticsearch->bulk($params->toArray());
+        $response = $this->elasticsearch->bulk($params->toArray());
+        if (array_key_exists('errors', $response) && $response['errors']) {
+            $error = new ServerErrorResponseException(json_encode($response, JSON_PRETTY_PRINT));
+            throw new \Exception('Bulk update error', $error->getCode(), $error);
+        }
     }
 
     /**
@@ -103,9 +107,51 @@ final class ElasticSearchEngine extends Engine
      */
     public function map(BaseBuilder $builder, $results, $model)
     {
-        $hits = new EloquentHitsIteratorAggregate($results, $builder->queryCallback);
+        $hits = app()->makeWith(
+            HitsIteratorAggregate::class,
+            [
+                'results'  => $results,
+                'callback' => $builder->queryCallback,
+            ]
+        );
 
         return new Collection($hits);
+    }
+
+    /**
+     * Map the given results to instances of the given model via a lazy collection.
+     *
+     * @param  \Laravel\Scout\Builder  $builder
+     * @param  mixed  $results
+     * @param  \Illuminate\Database\Eloquent\Model  $model
+     * @return \Illuminate\Support\LazyCollection
+     */
+    public function lazyMap(Builder $builder, $results, $model)
+    {
+        throw new \Error('Not implemented');
+    }
+
+    /**
+     * Create a search index.
+     *
+     * @param  string  $name
+     * @param  array  $options
+     * @return mixed
+     */
+    public function createIndex($name, array $options = [])
+    {
+        throw new \Error('Not implemented');
+    }
+
+    /**
+     * Delete a search index.
+     *
+     * @param  string  $name
+     * @return mixed
+     */
+    public function deleteIndex($name)
+    {
+        throw new \Error('Not implemented');
     }
 
     /**
@@ -113,7 +159,7 @@ final class ElasticSearchEngine extends Engine
      */
     public function getTotalCount($results)
     {
-        return $results['hits']['total'];
+        return $results['hits']['total']['value'];
     }
 
     /**
@@ -134,7 +180,7 @@ final class ElasticSearchEngine extends Engine
                 $searchBody
             );
         }
-        /** @var Searchable $model */
+
         $model = $builder->model;
         $indexName = $builder->index ?: $model->searchableAs();
         $params = new SearchParams($indexName, $searchBody->toArray());

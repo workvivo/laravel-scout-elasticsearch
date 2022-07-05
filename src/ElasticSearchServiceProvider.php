@@ -15,9 +15,16 @@ final class ElasticSearchServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
+        $this->mergeConfigFrom(__DIR__.'/../config/elasticsearch.php', 'elasticsearch');
+
         $this->app->bind(Client::class, function () {
             return ClientBuilder::create()->setHosts([config('elasticsearch.host')])->build();
         });
+
+        $this->app->bind(
+            'Matchish\ScoutElasticSearch\ElasticSearch\HitsIteratorAggregate',
+            'Matchish\ScoutElasticSearch\ElasticSearch\EloquentHitsIteratorAggregate'
+        );
     }
 
     /**
