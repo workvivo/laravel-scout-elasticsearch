@@ -50,6 +50,7 @@ final class DefaultImportSource implements ImportSource
     {
         $query = $this->newQuery();
         $totalSearchables = $query->count();
+
         if ($totalSearchables) {
             $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
             $totalChunks = (int) ceil($totalSearchables / $chunkSize);
@@ -82,7 +83,6 @@ final class DefaultImportSource implements ImportSource
         if (method_exists($this, 'searchableCountRelations')) {
             $searchableCountRelations = $this->searchableCountRelations();
         }
-
         $query
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
@@ -91,6 +91,7 @@ final class DefaultImportSource implements ImportSource
                 return $query->withCount($searchableCountRelations);
             })
             ->orderBy($this->model()->getKeyName());
+
         $scopes = $this->scopes;
 
         return collect($scopes)->reduce(function ($instance, $scope) {
