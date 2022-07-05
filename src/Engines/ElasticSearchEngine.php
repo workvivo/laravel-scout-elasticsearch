@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Engines;
 
 use Elasticsearch\Common\Exceptions\ServerErrorResponseException;
@@ -37,7 +39,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function update($models)
     {
@@ -51,7 +53,25 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * Update the given model in the index.
+     *
+     * @param  \Illuminate\Database\Eloquent\Collection  $models
+     * @return array
+     */
+    public function updateAsync($models)
+    {
+        $params = new Bulk();
+        $params->index($models);
+        $paramArray = $params->toArray();
+        $paramArray['client'] = [
+            'future' => 'lazy',
+        ];
+
+        return $this->elasticsearch->bulk($paramArray);
+    }
+
+    /**
+     * @inheritdoc
      */
     public function delete($models)
     {
@@ -61,7 +81,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function flush($model)
     {
@@ -76,7 +96,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function search(BaseBuilder $builder)
     {
@@ -84,7 +104,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function paginate(BaseBuilder $builder, $perPage, $page)
     {
@@ -95,27 +115,11 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function mapIds($results)
     {
         return collect($results['hits']['hits'])->pluck('_id');
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function map(BaseBuilder $builder, $results, $model)
-    {
-        $hits = app()->makeWith(
-            HitsIteratorAggregate::class,
-            [
-                'results'  => $results,
-                'callback' => $builder->queryCallback,
-            ]
-        );
-
-        return new Collection($hits);
     }
 
     /**
@@ -155,7 +159,23 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
+     */
+    public function map(BaseBuilder $builder, $results, $model)
+    {
+        $hits = app()->makeWith(
+            HitsIteratorAggregate::class,
+            [
+                'results'  => $results,
+                'callback' => $builder->queryCallback,
+            ]
+        );
+
+        return new Collection($hits);
+    }
+
+    /**
+     * @inheritdoc
      */
     public function getTotalCount($results)
     {

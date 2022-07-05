@@ -7,24 +7,23 @@ namespace Matchish\ScoutElasticSearch\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Matchish\ScoutElasticSearch\Jobs\Import;
-use Matchish\ScoutElasticSearch\Jobs\QueueableJob;
-use Matchish\ScoutElasticSearch\Searchable\ImportSource;
+use Matchish\ScoutElasticSearch\Jobs\TrackableJob;
 use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
 
 final class ImportCommand extends Command
 {
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $signature = 'scout:import {searchable?* : The name of the searchable}';
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $description = 'Create new index and import all searchable into the one';
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function handle(): void
     {
@@ -48,9 +47,10 @@ final class ImportCommand extends Command
         $sourceFactory = app(ImportSourceFactory::class);
         $source = $sourceFactory::from($searchable);
         $job = new Import($source);
+        $progressbar = (new ProgressBarFactory($this->output))->create();
 
         if (config('scout.queue')) {
-            $job = (new QueueableJob())->chain([$job]);
+            $job = (new TrackableJob())->chain([$job]);
         }
 
         $bar = (new ProgressBarFactory($this->output))->create();
@@ -63,7 +63,14 @@ final class ImportCommand extends Command
         dispatch($job)->allOnQueue($source->syncWithSearchUsingQueue())
             ->allOnConnection($source->syncWithSearchUsing());
 
-        $doneMessage = trans(config('scout.queue') ? 'scout::import.done.queue' : 'scout::import.done', [
+        if (config('scout.queue')) {
+            $isQueuedMessage = trans('scout::import.done.queue', [
+                    'searchable' => $searchable,
+                ]);
+            $this->line($isQueuedMessage);
+        }
+
+        $doneMessage = trans('scout::import.done', [
             'searchable' => $searchable,
         ]);
         $this->output->success($doneMessage);

@@ -1,32 +1,26 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Database\Scopes;
 
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Scope;
-use Illuminate\Support\Facades\Cache;
 
-class PageScope implements Scope
+class FromScope implements Scope
 {
     /**
-     * @var int
+     * @var mixed
      */
-    private $page;
-    /**
-     * @var int
-     */
-    private $perPage;
+    private $from;
 
     /**
-     * PageScope constructor.
-     * @param int $page
-     * @param int $perPage
+     * @param mixed $from
      */
-    public function __construct(int $page, int $perPage)
+    public function __construct($from)
     {
-        $this->page = $page;
-        $this->perPage = $perPage;
+        $this->from = $from;
     }
 
     /**
@@ -38,6 +32,7 @@ class PageScope implements Scope
      */
     public function apply(Builder $builder, Model $model)
     {
-        $builder->forPageAfterId($this->perPage, Cache::get('scout_import_last_id', 0), $model->getKeyName());
+        $column = $model->getKeyName();
+        $builder->where($column, '>', $this->from);
     }
 }

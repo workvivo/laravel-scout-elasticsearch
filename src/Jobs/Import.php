@@ -1,10 +1,12 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Jobs;
 
 use Elasticsearch\Client;
 use Illuminate\Bus\Queueable;
-use Illuminate\Support\Collection;
+use Imtigger\LaravelJobStatus\Trackable;
 use Matchish\ScoutElasticSearch\ProgressReportable;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
@@ -13,6 +15,7 @@ use Matchish\ScoutElasticSearch\Searchable\ImportSource;
  */
 final class Import
 {
+    use Trackable;
     use Queueable;
     use ProgressReportable;
 
@@ -29,22 +32,28 @@ final class Import
         $this->source = $source;
     }
 
-    /**
-     * @param Client $elasticsearch
-     */
-    public function handle(Client $elasticsearch): void
+    public function handle(): void
     {
-        $stages = $this->stages();
-        $estimate = $stages->sum->estimate();
-        $this->progressBar()->setMaxSteps($estimate);
-        $stages->each(function ($stage) use ($elasticsearch) {
-            $this->progressBar()->setMessage($stage->title());
-            $stage->handle($elasticsearch);
-            $this->progressBar()->advance($stage->estimate());
+        list($stages, $estimate) = $this->stages();
+
+        $this->progressMax = $estimate;
+        $stages->each(function ($stage) {
+            if (! is_iterable($stage)) {
+                // @phpstan-ignore-next-line
+                app()->call([$stage, 'handle']);
+
+                return;
+            }
+            $queues = $this->source->syncWithSearchUsingQueues();
+            foreach ($stage as $key => $sub) {
+                $queue = $queues[$key % count($queues)];
+                dispatch((new TrackableJob())->chain([$sub])->allOnConnection($this->source->syncWithSearchUsing())
+                ->allOnQueue($queue));
+            }
         });
     }
 
-    private function stages(): Collection
+    private function stages(): array
     {
         return ImportStages::fromSource($this->source);
     }

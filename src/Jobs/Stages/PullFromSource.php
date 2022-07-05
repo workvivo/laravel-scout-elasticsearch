@@ -1,8 +1,14 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
+use Illuminate\Bus\Queueable;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\LazyCollection;
+use Imtigger\LaravelJobStatus\Trackable;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
 /**
@@ -10,30 +16,27 @@ use Matchish\ScoutElasticSearch\Searchable\ImportSource;
  */
 final class PullFromSource
 {
-    /**
-     * @var ImportSource
-     */
-    private $source;
+    use Queueable;
+    private Collection $source;
 
-    /**
-     * @param ImportSource $source
-     */
-    public function __construct(ImportSource $source)
+    public function __construct(Collection $source)
     {
         $this->source = $source;
     }
 
     public function handle(): void
     {
-        $results = $this->source->get()->filter->shouldBeSearchable();
-        if (! $results->isEmpty()) {
-            $results->first()->searchableUsing()->update($results);
-        }
+        $this->source->each(function ($chunk) {
+            $results = $chunk->get()->filter->shouldBeSearchable();
+            if (! $results->isEmpty()) {
+                $results->first()->searchableUsing()->update($results);
+            }
+        });
     }
 
     public function estimate(): int
     {
-        return 1;
+        return $this->source->count();
     }
 
     public function title(): string
@@ -43,12 +46,12 @@ final class PullFromSource
 
     /**
      * @param ImportSource $source
-     * @return Collection
+     * @return LazyCollection
      */
-    public static function chunked(ImportSource $source): Collection
+    public static function chunked(ImportSource $source): LazyCollection
     {
-        return $source->chunked()->map(function ($chunk) {
-            return new static($chunk);
+        return $source->chunked()->map(function ($chunks) {
+            return new self($chunks);
         });
     }
 }

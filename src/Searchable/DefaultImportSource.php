@@ -1,15 +1,20 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Matchish\ScoutElasticSearch\Searchable;
 
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
-use Illuminate\Support\Collection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\LazyCollection;
+use Matchish\ScoutElasticSearch\Database\Scopes\FromScope;
 use Matchish\ScoutElasticSearch\Database\Scopes\PageScope;
 
 final class DefaultImportSource implements ImportSource
 {
     const DEFAULT_CHUNK_SIZE = 500;
+    const DEFAULT_CHUNK_HANDLERS = 1;
 
     /**
      * @var string
@@ -19,6 +24,14 @@ final class DefaultImportSource implements ImportSource
      * @var array
      */
     private $scopes;
+    /**
+     * @var ?object
+     */
+    private $last;
+    /**
+     * @var int
+     */
+    private $count;
 
     /**
      * DefaultImportSource constructor.
@@ -41,27 +54,48 @@ final class DefaultImportSource implements ImportSource
         return $this->model()->syncWithSearchUsing();
     }
 
+    public function syncWithSearchUsingQueues(): array
+    {
+        return [
+            env('AWS_SQS_QUEUE'),
+        ];
+    }
+
     public function searchableAs(): string
     {
         return $this->model()->searchableAs();
     }
 
-    public function chunked(): Collection
+    public function chunked(): LazyCollection
     {
-        $query = $this->newQuery();
-        $totalSearchables = $query->count();
-        if ($totalSearchables) {
+        return LazyCollection::make(function () {
             $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
-            $totalChunks = (int) ceil($totalSearchables / $chunkSize);
+            $workers = (int) config('scout.chunk.handlers', self::DEFAULT_CHUNK_HANDLERS);
+            $from = null;
+            while (true) {
+                $chunks = [];
+                for ($page = 1; $page <= $workers; $page++) {
+                    $chunkScopes = [];
+                    if ($from) {
+                        $chunkScopes[] = $from;
+                    }
+                    $chunkScopes[] = new PageScope($page, $chunkSize);
+                    $chunk = new static($this->className, array_merge($this->scopes, $chunkScopes));
+                    if ($page === 1 && ! $chunk->count()) {
+                        break 2;
+                    }
+                    $chunks[] = $chunk;
+                }
+                yield collect($chunks);
 
-            return collect(range(1, $totalChunks))->map(function ($page) use ($chunkSize) {
-                $chunkScope = new PageScope($page, $chunkSize);
-
-                return new static($this->className, array_merge($this->scopes, [$chunkScope]));
-            });
-        } else {
-            return collect();
-        }
+                $last = isset($chunk) ? $chunk->last() : null;
+                if ($last instanceof Model) {
+                    $from = new FromScope($last->getKey());
+                } else {
+                    break;
+                }
+            }
+        });
     }
 
     /**
@@ -82,7 +116,6 @@ final class DefaultImportSource implements ImportSource
         if (method_exists($this, 'searchableCountRelations')) {
             $searchableCountRelations = $this->searchableCountRelations();
         }
-
         $query
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
@@ -91,6 +124,7 @@ final class DefaultImportSource implements ImportSource
                 return $query->withCount($searchableCountRelations);
             })
             ->orderBy($this->model()->getKeyName());
+
         $scopes = $this->scopes;
 
         return collect($scopes)->reduce(function ($instance, $scope) {
@@ -104,7 +138,34 @@ final class DefaultImportSource implements ImportSource
     {
         /** @var EloquentCollection $models */
         $models = $this->newQuery()->get();
+        $this->last = $models->last();
+        $this->count = $models->count();
 
         return $models;
+    }
+
+    public function count(): int
+    {
+        if (isset($this->count)) {
+            return $this->count;
+        }
+
+        return $this->newQuery()->count();
+    }
+
+    public function chunksCount(): int
+    {
+        $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
+
+        return (int) ceil($this->count() / $chunkSize);
+    }
+
+    public function last(): ?object
+    {
+        if ($this->last) {
+            return $this->last;
+        }
+
+        return $this->get()->last();
     }
 }
