@@ -47,14 +47,14 @@ final class ImportCommand extends Command
         $sourceFactory = app(ImportSourceFactory::class);
         $source = $sourceFactory::from($searchable);
         $job = new Import($source);
-        $progressbar = (new ProgressBarFactory($this->output))->create();
+        // $progressbar = (new ProgressBarFactory($this->output))->create();
 
         if (config('scout.queue')) {
             $job = (new TrackableJob())->chain([$job]);
         }
 
-        $bar = (new ProgressBarFactory($this->output))->create();
-        $job->withProgressReport($bar);
+        // $bar = (new ProgressBarFactory($this->output))->create();
+        // $job->withProgressReport($bar);
 
         $startMessage = trans('scout::import.start', ['searchable' => "<comment>$searchable</comment>"]);
         $this->line($startMessage);
