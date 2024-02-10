@@ -17,12 +17,12 @@
         }
     ],
     "require": {
-        "php": "^7.2|^7.3",
+        "php": "^7.2|^7.3|^8.0|^8.1",
         "elasticsearch/elasticsearch": ">=7.2",
         "handcraftedinthealps/elasticsearch-dsl": "7.2.0.4",
         "imtigger/laravel-job-status": "^1.2",
         "laravel/scout": "^8.0|^9.0",
-        "roave/better-reflection": "^3.3|^4.3"
+        "roave/better-reflection": "^6"
     },
     "require-dev": {
         "laravel/legacy-factories": "^1.0",
