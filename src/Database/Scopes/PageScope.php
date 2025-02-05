@@ -42,7 +42,7 @@ class PageScope implements Scope
         $keyName = $model->getKeyName();
 
         if($keyName === 'id') {
-            $builder->forPageAfterId($this->perPage, Cache::get('scout_import_last_id', 0), $keyName);
+            $builder->forPageAfterId($this->perPage, Cache::get('scout_import_last_id', 0), $model->getTable().'.id');
         } else {
             $builder->forPage($this->page, $this->perPage);
         }
