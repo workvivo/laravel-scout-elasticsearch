@@ -76,7 +76,7 @@ final class DefaultImportSource implements ImportSource
 
     private function newQuery(): Builder
     {
-        $query = $this->className::makeAllSearchableUsing($this->model()->newQuery());
+        $query = $this->className::__callStatic('makeAllSearchableUsing', [$this->model()->newQuery()]);
 
         $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
 
