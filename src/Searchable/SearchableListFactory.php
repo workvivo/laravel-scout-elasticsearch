@@ -143,6 +143,14 @@ final class SearchableListFactory
         try {
             $reflection = $this->reflector()->reflectClass($class);
 
+            if ($reflection->hasProperty('excludeFromSearchIndex')) {
+                $property = $reflection->getProperty('excludeFromSearchIndex');
+
+                if ($property->getDefaultValue() === true) {
+                    return false;
+                }
+            }
+
             if (in_array(Searchable::class, $traits = $reflection->getTraitNames())) {
                 return true;
             }
