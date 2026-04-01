@@ -2,8 +2,6 @@
 
 namespace Matchish\ScoutElasticSearch\Engines;
 
-use Elastic\Elasticsearch\Client;
-use Elastic\Elasticsearch\Exception\ServerResponseException;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\LazyCollection;
 use Laravel\Scout\Builder;
@@ -17,6 +15,8 @@ use Matchish\ScoutElasticSearch\ElasticSearch\SearchFactory;
 use Matchish\ScoutElasticSearch\ElasticSearch\SearchResults;
 use ONGR\ElasticsearchDSL\Query\MatchAllQuery;
 use ONGR\ElasticsearchDSL\Search;
+use OpenSearch\Client;
+use OpenSearch\Common\Exceptions\ServerErrorResponseException;
 
 final class ElasticSearchEngine extends Engine
 {
@@ -39,21 +39,21 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function update($models)
     {
         $params = new Bulk();
         $params->index($models);
-        $response = $this->elasticsearch->bulk($params->toArray())->asArray();
+        $response = $this->elasticsearch->bulk($params->toArray());
         if (array_key_exists('errors', $response) && $response['errors']) {
-            $error = new ServerResponseException(json_encode($response, JSON_PRETTY_PRINT));
+            $error = new ServerErrorResponseException(json_encode($response, JSON_PRETTY_PRINT));
             throw new \Exception('Bulk update error', $error->getCode(), $error);
         }
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function delete($models)
     {
@@ -63,12 +63,12 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function flush($model)
     {
         $indexName = $model->searchableAs();
-        $exist = $this->elasticsearch->indices()->exists(['index' => $indexName])->asBool();
+        $exist = $this->elasticsearch->indices()->exists(['index' => $indexName]);
         if ($exist) {
             $body = (new Search())->addQuery(new MatchAllQuery())->toArray();
             $params = new SearchParams($indexName, $body);
@@ -78,7 +78,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function search(BaseBuilder $builder)
     {
@@ -86,7 +86,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function paginate(BaseBuilder $builder, $perPage, $page)
     {
@@ -97,7 +97,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function mapIds($results)
     {
@@ -105,7 +105,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function map(BaseBuilder $builder, $results, $model)
     {
@@ -123,10 +123,10 @@ final class ElasticSearchEngine extends Engine
     /**
      * Map the given results to instances of the given model via a lazy collection.
      *
-     * @param  \Laravel\Scout\Builder  $builder
+     * @param  BaseBuilder  $builder
      * @param  mixed  $results
      * @param  \Illuminate\Database\Eloquent\Model  $model
-     * @return \Illuminate\Support\LazyCollection
+     * @return LazyCollection
      */
     public function lazyMap(Builder $builder, $results, $model)
     {
@@ -142,7 +142,8 @@ final class ElasticSearchEngine extends Engine
         $objectIdPositions = array_flip($objectIds);
 
         return $model->queryScoutModelsByIds(
-            $builder, $objectIds
+            $builder,
+            $objectIds
         )->cursor()->filter(function ($model) use ($objectIds) {
             return in_array($model->getScoutKey(), $objectIds);
         })->sortBy(function ($model) use ($objectIdPositions) {
@@ -174,7 +175,7 @@ final class ElasticSearchEngine extends Engine
     }
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function getTotalCount($results)
     {
@@ -204,6 +205,6 @@ final class ElasticSearchEngine extends Engine
         $indexName = $builder->index ?: $model->searchableAs();
         $params = new SearchParams($indexName, $searchBody->toArray());
 
-        return $this->elasticsearch->search($params->toArray())->asArray();
+        return $this->elasticsearch->search($params->toArray());
     }
 }

@@ -10,26 +10,30 @@ use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
 final class FlushCommand extends Command
 {
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $signature = 'scout:flush {searchable?* : The name of the searchable}';
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $description = 'Flush the index of the the given searchable';
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function handle(): void
     {
         $command = $this;
-        $searchableList = collect($command->argument('searchable'))->whenEmpty(function () {
+
+        $searchable = $command->argument('searchable') ?? [];
+
+        $searchableList = collect($searchable)->whenEmpty(function () {
             $factory = new SearchableListFactory(app()->getNamespace(), app()->path());
 
             return $factory->make();
         });
+
         $searchableList->each(function ($searchable) {
             $searchable::removeAllFromSearch();
             $doneMessage = trans('scout::flush.done', [

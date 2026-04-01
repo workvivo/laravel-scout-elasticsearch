@@ -2,7 +2,7 @@
 
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
-use Elastic\Elasticsearch\Client;
+use OpenSearch\Client;
 
 interface StageInterface
 {

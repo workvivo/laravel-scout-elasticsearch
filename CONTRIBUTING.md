@@ -18,5 +18,6 @@ We have [StyleCI](https://styleci.io/) setup to automatically fix any code style
 
 # Running tests
 
-Run `make install` to prepare docker containers for  tests  
-Run tests `make test`
+Run `make install` to prepare docker containers for  tests
+Run `docker-composer build` to build the images
+Run `make test-unit` to perform the test suite

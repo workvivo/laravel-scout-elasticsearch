@@ -16,16 +16,16 @@ use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
 final class ImportCommand extends Command
 {
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $signature = 'scout:import {searchable?* : The name of the searchable}';
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     protected $description = 'Create new index and import all searchable into the one';
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function handle(): void
     {

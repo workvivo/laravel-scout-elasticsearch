@@ -18,7 +18,10 @@ use Tests\IntegrationTestCase;
 
 final class ImportCommandTest extends IntegrationTestCase
 {
-    public function test_import_entites(): void
+    /**
+     * @test
+     */
+    public function import_entites(): void
     {
         $dispatcher = Product::getEventDispatcher();
         Product::unsetEventDispatcher();
@@ -47,7 +50,10 @@ final class ImportCommandTest extends IntegrationTestCase
         $this->assertEquals($productsAmount, $response['hits']['total']['value']);
     }
 
-    public function test_import_entites_in_queue(): void
+    /**
+     * @test
+     */
+    public function import_entites_in_queue(): void
     {
         $this->app['config']->set('scout.queue', ['connection' => 'sync', 'queue' => 'scout']);
 
@@ -72,7 +78,10 @@ final class ImportCommandTest extends IntegrationTestCase
         $this->assertEquals($productsAmount, $response['hits']['total']['value']);
     }
 
-    public function test_import_all_pages(): void
+    /**
+     * @test
+     */
+    public function import_all_pages(): void
     {
         $dispatcher = Product::getEventDispatcher();
         Product::unsetEventDispatcher();
@@ -96,11 +105,15 @@ final class ImportCommandTest extends IntegrationTestCase
         $this->assertEquals($productsAmount, $response['hits']['total']['value']);
     }
 
-    public function test_import_with_custom_key_all_pages(): void
+    /**
+     * @test
+     */
+    public function import_with_custom_key_all_pages(): void
     {
         $this->app['config']['scout.key'] = 'title';
 
         $dispatcher = Book::getEventDispatcher();
+
         Book::unsetEventDispatcher();
 
         $booksAmount = 10;
@@ -110,6 +123,7 @@ final class ImportCommandTest extends IntegrationTestCase
         Book::setEventDispatcher($dispatcher);
 
         Artisan::call('scout:import');
+
         $params = [
             'index' => (new BookWithCustomKey())->searchableAs(),
             'body' => [
@@ -118,11 +132,16 @@ final class ImportCommandTest extends IntegrationTestCase
                 ],
             ],
         ];
+
         $response = $this->elasticsearch->search($params);
+
         $this->assertEquals($booksAmount, $response['hits']['total']['value']);
     }
 
-    public function test_remove_old_index_after_switching_to_new(): void
+    /**
+     * @test
+     */
+    public function remove_old_index_after_switching_to_new(): void
     {
         $params = [
             'index' => 'products_old',
@@ -146,10 +165,13 @@ final class ImportCommandTest extends IntegrationTestCase
 
         Artisan::call('scout:import');
 
-        $this->assertFalse($this->elasticsearch->indices()->exists(['index' => 'products_old'])->asBool(), 'Old index must be deleted');
+        $this->assertFalse($this->elasticsearch->indices()->exists(['index' => 'products_old']), 'Old index must be deleted');
     }
 
-    public function test_progress_report(): void
+    /**
+     * @test
+     */
+    public function progress_report(): void
     {
         $output = new BufferedOutput();
         Artisan::call('scout:import', ['searchable' => [Product::class, Book::class]], $output);
@@ -161,19 +183,22 @@ final class ImportCommandTest extends IntegrationTestCase
         );
         $this->assertEquals(
             '[OK] '.trans('scout::import.done', ['searchable' => Product::class]),
-            trim($output[14])
+            trim($output[17])
         );
         $this->assertEquals(
             trans('scout::import.start', ['searchable' => Book::class]),
-            trim($output[16])
+            trim($output[19])
         );
         $this->assertEquals(
             '[OK] '.trans('scout::import.done', ['searchable' => Book::class]),
-            trim($output[30])
+            trim($output[36])
         );
     }
 
-    public function test_progress_report_in_queue(): void
+    /**
+     * @test
+     */
+    public function progress_report_in_queue(): void
     {
         $this->app['config']->set('scout.queue', ['connection' => 'sync', 'queue' => 'scout']);
 
@@ -186,7 +211,10 @@ final class ImportCommandTest extends IntegrationTestCase
         $this->assertContains('[OK] '.trans('scout::import.done.queue', ['searchable' => Product::class]), $output);
     }
 
-    public function test_queue_timeout_configuration(): void
+    /**
+     * @test
+     */
+    public function queue_timeout_configuration(): void
     {
         Bus::fake([
             QueueableJob::class,
@@ -208,7 +236,10 @@ final class ImportCommandTest extends IntegrationTestCase
         });
     }
 
-    public function test_chained_queue_timeout_configuration(): void
+    /**
+     * @test
+     */
+    public function chained_queue_timeout_configuration(): void
     {
         Bus::fake([
             Import::class,
@@ -230,7 +261,10 @@ final class ImportCommandTest extends IntegrationTestCase
         });
     }
 
-    public function test_chained_queue_timeout_configuration_with_null_value(): void
+    /**
+     * @test
+     */
+    public function chained_queue_timeout_configuration_with_null_value(): void
     {
         Bus::fake([
             Import::class,
@@ -252,7 +286,10 @@ final class ImportCommandTest extends IntegrationTestCase
         });
     }
 
-    public function test_chained_queue_timeout_configuration_with_empty_string(): void
+    /**
+     * @test
+     */
+    public function chained_queue_timeout_configuration_with_empty_string(): void
     {
         Bus::fake([
             Import::class,
@@ -274,7 +311,10 @@ final class ImportCommandTest extends IntegrationTestCase
         });
     }
 
-    public function test_makeAllSearchableUsing_method_is_called_in_the_product_model(): void
+    /**
+     * @test
+     */
+    public function make_all_searchable_using_method_is_called_in_the_product_model(): void
     {
         $dispatcher = Post::getEventDispatcher();
         Post::unsetEventDispatcher();

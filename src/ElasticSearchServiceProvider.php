@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace Matchish\ScoutElasticSearch;
 
-use Elastic\Elasticsearch\Client;
-use Elastic\Elasticsearch\ClientBuilder;
+use OpenSearch\Client;
+use OpenSearch\ClientBuilder;
 use Illuminate\Support\ServiceProvider;
 use Matchish\ScoutElasticSearch\ElasticSearch\Config\Config;
 use Matchish\ScoutElasticSearch\ElasticSearch\EloquentHitsIteratorAggregate;

@@ -2,7 +2,7 @@
 
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
-use Elastic\Elasticsearch\Client;
+use OpenSearch\Client;
 use Matchish\ScoutElasticSearch\ElasticSearch\DefaultAlias;
 use Matchish\ScoutElasticSearch\ElasticSearch\FilteredAlias;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;

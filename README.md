@@ -5,7 +5,7 @@
 <!--   <a href="https://github.com/matchish/laravel-scout-elasticsearch">
     <img alt="Scout ElasticSearch" src="https://raw.githubusercontent.com/matchish/laravel-scout-elasticsearch/master/docs/banner.svg?sanitize=true" >
   </a> -->
-  
+
   <img alt="Import progress report" src="https://raw.githubusercontent.com/matchish/laravel-scout-elasticsearch/master/docs/demo.gif" >
 
   <p align="center">
@@ -29,7 +29,7 @@ great features, and at the same time leverage the complete set of ElasticSearchâ
 
 If you need any help, [stack overflow](https://stackoverflow.com/questions/tagged/laravel-scout%20laravel%20elasticsearch) is the preferred and recommended way to ask support questions.
 
-## :two_hearts: Features  
+## :two_hearts: Features
 Don't forget to :star: the package if you like it. :pray:
 
 - Laravel Scout 10.x support
@@ -63,10 +63,10 @@ Set env variables
 SCOUT_DRIVER=Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine
 ```
 
-The package uses `\ElasticSearch\Client` from official package, but does not try to configure it, 
-so feel free do it in your app service provider. 
-But if you don't want to do it right now, 
-you can use `Matchish\ElasticSearchServiceProvider` from the package.  
+The package uses `\ElasticSearch\Client` from official package, but does not try to configure it,
+so feel free do it in your app service provider.
+But if you don't want to do it right now,
+you can use `Matchish\ElasticSearchServiceProvider` from the package.
 Register the provider, adding to `config/app.php`
 ```php
 'providers' => [
@@ -83,7 +83,7 @@ or use commas as separator for additional nodes
 ```
 ELASTICSEARCH_HOST=host:port,host:port
 ```
-And publish config example for elasticsearch  
+And publish config example for elasticsearch
 `php artisan vendor:publish --tag config`
 
 ## :bulb: Usage
@@ -93,22 +93,22 @@ And publish config example for elasticsearch
 ### Index [settings](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-create-index.html#create-index-settings) and [mappings](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-create-index.html#mappings)
 It is very important to define the mapping when we create an index â€” an inappropriate preliminary definition and mapping may result in the wrong search results.
 
-To define mappings or settings for index, set config with right value. 
+To define mappings or settings for index, set config with right value.
 
-For example if method `searchableAs` returns 
+For example if method `searchableAs` returns
 `products` string
 
-Config key for mappings should be  
-`elasticsearch.indices.mappings.products`  
-Or you you can specify default mappings with config key 
+Config key for mappings should be
+`elasticsearch.indices.mappings.products`
+Or you you can specify default mappings with config key
 `elasticsearch.indices.mappings.default`
 
 Same way you can define settings
 
-For index `products` it will be  
-`elasticsearch.indices.settings.products`  
+For index `products` it will be
+`elasticsearch.indices.settings.products`
 
-And for default settings  
+And for default settings
 `elasticsearch.indices.settings.default`
 
 ### Eager load
@@ -121,7 +121,7 @@ use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 public function register(): void
 {
 $this->app->bind(ImportSourceFactory::class, MyImportSourceFactory::class);
-``` 
+```
 Here is an example of `MyImportSourceFactory`
 ```php
 namespace Matchish\ScoutElasticSearch\Searchable;
@@ -156,7 +156,7 @@ provided by Laravel Scout through the `Searchable` trait
 
 #### Example:
 ```php
-class Product extends Model 
+class Product extends Model
 {
     use Searchable;
 
@@ -178,10 +178,10 @@ class Product extends Model
 }
 ```
 
-This example will make sure the categories relationship gets always loaded on the model when 
+This example will make sure the categories relationship gets always loaded on the model when
 saving it.
 ### Zero downtime reimport
-While working in production, to keep your existing search experience available while reimporting your data, you also can use `scout:import` Artisan command:  
+While working in production, to keep your existing search experience available while reimporting your data, you also can use `scout:import` Artisan command:
 
 `php artisan scout:import`
 
@@ -189,9 +189,9 @@ The command create new temporary index, import all models to it, and then switch
 
 ### Search
 
-To be fully compatible with original scout package, this package does not add new methods.  
+To be fully compatible with original scout package, this package does not add new methods.
 So how we can build complex queries?
-There is two ways.   
+There is two ways.
 By default, when you pass a query to the `search` method, the engine builds a [query_string](https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-query-string-query.html) query, so you can build queries like this
 
 ```php
@@ -205,32 +205,23 @@ $results = Product::search('zonga', function(\Elastic\Elasticsearch\Client $clie
 
     $minPriceAggregation = new MinAggregation('min_price');
     $minPriceAggregation->setField('price');
-    
+
     $maxPriceAggregation = new MaxAggregation('max_price');
     $maxPriceAggregation->setField('price');
-    
+
     $brandTermAggregation = new TermsAggregation('brand');
     $brandTermAggregation->setField('brand');
 
     $body->addAggregation($minPriceAggregation);
     $body->addAggregation($brandTermAggregation);
-    
-    return $client->search(['index' => 'products', 'body' => $body->toArray()])->asArray();
+
+    return $client->search(['index' => 'products', 'body' => $body->toArray()]);
 })->raw();
 ```
 
-> Note : The callback function will get 2 parameters. First one is `$client` and it is an object of `\Elastic\Elasticsearch\Client` 
-> class from [elasticsearch/elasticsearch](https://packagist.org/packages/elasticsearch/elasticsearch) package. 
-> And the second one is `$body` which is an object of `\ONGR\ElasticsearchDSL\Search` from 
-> [ongr/elasticsearch-dsl](https://packagist.org/packages/handcraftedinthealps/elasticsearch-dsl) package. So, while
-> as you can see the example above, `$client->search(....)` method will return an 
-> `\Elastic\Elasticsearch\Response\Elasticsearch` object. And you need to use `asArray()` method to get array result. 
-> Otherwise, the `HitsIteratorAggregate` class will throw an error. You can check the issue 
-> [here](https://github.com/matchish/laravel-scout-elasticsearch/issues/215).
-
 ### Conditions ###
 
-Scout supports only 3 conditions: `->where(column, value)` (strict equation), `->whereIn(column, array)` and `->whereNotIn(column, array)`: 
+Scout supports only 3 conditions: `->where(column, value)` (strict equation), `->whereIn(column, array)` and `->whereNotIn(column, array)`:
 
 ```php
 Product::search('(title:this OR description:this) AND (title:that OR description:that)')

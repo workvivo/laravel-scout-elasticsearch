@@ -2,9 +2,10 @@
 
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
-use Elastic\Elasticsearch\Client;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
+use OpenSearch\Client;
 
 /**
  * @internal
@@ -26,8 +27,15 @@ final class PullFromSource implements StageInterface
 
     public function handle(Client $elasticsearch = null): void
     {
-        $results = $this->source->get()->filter->shouldBeSearchable();
+        $results = $this->source->get()->filter(function ($item) {
+            return $item->shouldBeSearchable();
+        });
+
         if (! $results->isEmpty()) {
+            $last_key = $results->last()->getKey();
+
+            Cache::put('scout_import_last_id', $results->last()->getKey());
+
             $results->first()->searchableUsing()->update($results);
         }
     }

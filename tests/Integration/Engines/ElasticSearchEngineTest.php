@@ -94,7 +94,7 @@ final class ElasticSearchEngineTest extends IntegrationTestCase
                 ],
             ],
         ];
-        $response = $this->elasticsearch->search($params)->asArray();
+        $response = $this->elasticsearch->search($params);
         $this->assertArrayHasKey('hits', $response);
         $this->assertArrayHasKey('total', $response['hits']);
         $this->assertArrayHasKey('value', $response['hits']['total']);
@@ -119,7 +119,7 @@ final class ElasticSearchEngineTest extends IntegrationTestCase
                 ],
             ],
         ];
-        $response = $this->elasticsearch->search($params)->asArray();
+        $response = $this->elasticsearch->search($params);
         $this->assertArrayHasKey('hits', $response);
         $this->assertArrayHasKey('total', $response['hits']);
         $this->assertArrayHasKey('value', $response['hits']['total']);

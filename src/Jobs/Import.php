@@ -2,7 +2,7 @@
 
 namespace Matchish\ScoutElasticSearch\Jobs;
 
-use Elastic\Elasticsearch\Client;
+use OpenSearch\Client;
 use Illuminate\Bus\Queueable;
 use Illuminate\Support\Collection;
 use Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface;

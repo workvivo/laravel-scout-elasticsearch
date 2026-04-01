@@ -3,7 +3,7 @@
 namespace Tests;
 
 use App\Product;
-use Elastic\Elasticsearch\Client;
+use OpenSearch\Client;
 
 /**
  * Class IntegrationTestCase.
@@ -16,7 +16,7 @@ class IntegrationTestCase extends TestCase
     protected $elasticsearch;
 
     /**
-     * {@inheritdoc}
+     * @inheritdoc
      */
     public function setUp(): void
     {

@@ -12,7 +12,10 @@ use Tests\IntegrationTestCase;
 
 final class FlushCommandTest extends IntegrationTestCase
 {
-    public function test_clear_index(): void
+    /**
+     * @test
+     */
+    public function clear_index(): void
     {
         $dispatcher = Product::getEventDispatcher();
         Product::unsetEventDispatcher();

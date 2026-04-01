@@ -12,7 +12,10 @@ use Tests\IntegrationTestCase;
 
 class ImportTest extends IntegrationTestCase
 {
-    public function test_progress_report()
+    /**
+     * @test
+     */
+    public function progress_report()
     {
         $dispatcher = Product::getEventDispatcher();
         Product::unsetEventDispatcher();
@@ -33,13 +36,14 @@ class ImportTest extends IntegrationTestCase
         dispatch($job);
 
         $this->assertEquals([
-            'Clean up 1/7',
-            'Create write index 2/7',
-            'Indexing... 3/7',
-            'Indexing... 4/7',
-            'Indexing... 5/7',
-            'Refreshing index 6/7',
-            'Switching to the new index 7/7',
+            'Clean up 1/8',
+            'Create write index 2/8',
+            'Clean Last Id 3/8',
+            'Indexing... 4/8',
+            'Indexing... 5/8',
+            'Indexing... 6/8',
+            'Refreshing index 7/8',
+            'Switching to the new index 8/8',
         ], $output->getLogs());
     }
 }

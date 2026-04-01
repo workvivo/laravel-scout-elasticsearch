@@ -13,7 +13,10 @@ use Tests\IntegrationTestCase;
 
 final class SwitchToNewAndRemoveOldIndexTest extends IntegrationTestCase
 {
-    public function test_switch_to_new_and_remove_old_index(): void
+    /**
+     * @test
+     */
+    public function switch_to_new_and_remove_old_index(): void
     {
         $this->elasticsearch->indices()->create([
             'index' => 'products_new',
@@ -27,9 +30,9 @@ final class SwitchToNewAndRemoveOldIndexTest extends IntegrationTestCase
         $stage = new SwitchToNewAndRemoveOldIndex(DefaultImportSourceFactory::from(Product::class), new Index('products_new'));
         $stage->handle($this->elasticsearch);
 
-        $newIndexExist = $this->elasticsearch->indices()->exists(['index' => 'products_new'])->asBool();
-        $oldIndexExist = $this->elasticsearch->indices()->exists(['index' => 'products_old'])->asBool();
-        $alias = $this->elasticsearch->indices()->getAlias(['index' => 'products_new'])->asArray();
+        $newIndexExist = $this->elasticsearch->indices()->exists(['index' => 'products_new']);
+        $oldIndexExist = $this->elasticsearch->indices()->exists(['index' => 'products_old']);
+        $alias = $this->elasticsearch->indices()->getAlias(['index' => 'products_new']);
 
         $this->assertTrue($newIndexExist);
         $this->assertFalse($oldIndexExist);

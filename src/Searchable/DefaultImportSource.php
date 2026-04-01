@@ -51,6 +51,7 @@ final class DefaultImportSource implements ImportSource
     {
         $query = $this->newQuery();
         $totalSearchables = $query->count();
+
         if ($totalSearchables) {
             $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
             $totalChunks = (int) ceil($totalSearchables / $chunkSize);
@@ -75,13 +76,16 @@ final class DefaultImportSource implements ImportSource
 
     private function newQuery(): Builder
     {
-        $query = $this->className::makeAllSearchableUsing($this->model()->newQuery());
+        $query = $this->className::__callStatic('makeAllSearchableUsing', [$this->model()->newQuery()]);
+
         $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
+
         $query
             ->when($softDelete, function ($query) {
                 return $query->withTrashed();
             })
             ->orderBy($this->model()->getQualifiedKeyName());
+
         $scopes = $this->scopes;
 
         return collect($scopes)->reduce(function ($instance, $scope) {
@@ -93,9 +97,6 @@ final class DefaultImportSource implements ImportSource
 
     public function get(): EloquentCollection
     {
-        /** @var EloquentCollection $models */
-        $models = $this->newQuery()->get();
-
-        return $models;
+        return $this->newQuery()->get();
     }
 }
