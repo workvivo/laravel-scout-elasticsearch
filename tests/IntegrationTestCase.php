@@ -3,30 +3,16 @@
 namespace Tests;
 
 use App\Product;
-use OpenSearch\Client;
 
 /**
  * Class IntegrationTestCase.
+ *
+ * Index cleanup (snapshot + diff) lives in the parent TestCase, so any test
+ * that ends up touching the cluster is covered regardless of inheritance.
+ * This subclass only adds the integration-specific mapping config.
  */
 class IntegrationTestCase extends TestCase
 {
-    /**
-     * @var Client
-     */
-    protected $elasticsearch;
-
-    /**
-     * @inheritdoc
-     */
-    public function setUp(): void
-    {
-        parent::setUp();
-
-        $this->elasticsearch = $this->app->make(Client::class);
-
-        $this->elasticsearch->indices()->delete(['index' => '_all']);
-    }
-
     protected function getEnvironmentSetUp($app)
     {
         parent::getEnvironmentSetUp($app);
