@@ -47,13 +47,22 @@ final class DefaultImportSource implements ImportSource
         return $this->model()->searchableAs();
     }
 
+    public function scoutChunkSize(): int
+    {
+        $model = $this->model();
+        if (method_exists($model, 'scoutChunkSize')) {
+            return (int) $model->scoutChunkSize();
+        }
+        return (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
+    }
+
     public function chunked(): Collection
     {
         $query = $this->newQuery();
         $totalSearchables = $query->count();
 
         if ($totalSearchables) {
-            $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
+            $chunkSize = $this->scoutChunkSize();
             $totalChunks = (int) ceil($totalSearchables / $chunkSize);
 
             return collect(range(1, $totalChunks))->map(function ($page) use ($chunkSize) {
