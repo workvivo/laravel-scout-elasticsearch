@@ -6,6 +6,13 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Scope;
 
+/**
+ * Offset-based page scope. No longer used by the import pipeline, which seeks
+ * by key range (see {@see \Matchish\ScoutElasticSearch\Database\Scopes\ChunkScope}).
+ * Kept for backwards compatibility only.
+ *
+ * @internal
+ */
 class PageScope implements Scope
 {
     /**

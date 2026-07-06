@@ -52,30 +52,48 @@ final class DefaultImportSource implements ImportSource
         $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
         $key = $this->model()->getQualifiedKeyName();
 
-        // Pull only the ordered primary keys instead of counting rows and
-        // paginating by offset. Selecting a single indexed column stays cheap
-        // even on huge tables, and it lets each chunk seek by key range
-        // (WHERE key > ? AND key <= ?) rather than OFFSET, so keyset paging
-        // costs the same for the first chunk and the last one. Imports no
-        // longer slow down as they progress through a large table.
+        // Build the chunk boundaries by seeking through the primary keys rather
+        // than counting rows and paginating by offset. Each chunk then imports
+        // its slice with a key-range seek (WHERE key > ? AND key <= ?) instead
+        // of OFFSET, so keyset paging costs the same for the first chunk and the
+        // last one — imports no longer slow down as they progress through a
+        // large table.
         //
-        // reorder()->orderBy($key) drops any competing ORDER BY (e.g. from a
-        // model global scope or makeAllSearchableUsing) so the key sequence is
-        // strictly monotonic. Without it the boundaries would be sorted by the
-        // wrong column and the id ranges would skip or duplicate rows.
-        $keys = $this->newQuery()->reorder()->orderBy($key)->pluck($key);
+        // Only the key column is read, and only one chunk of keys is held at a
+        // time, so this stays O(chunk size) in memory instead of loading every
+        // primary key at once — safe on tables with millions of rows. Each
+        // boundary is the last key of a chunk (its inclusive upper bound) and
+        // becomes the exclusive lower bound of the next chunk. reorder() drops
+        // any competing ORDER BY (e.g. from a model global scope or
+        // makeAllSearchableUsing) that would otherwise make the key sequence
+        // non-monotonic and cause chunks to skip or duplicate rows.
+        $bounds = collect();
+        $last = null;
 
-        if ($keys->isEmpty()) {
+        do {
+            $query = $this->newQuery()->reorder()->orderBy($key)->limit($chunkSize);
+
+            if ($last !== null) {
+                $query->where($key, '>', $last);
+            }
+
+            $keys = $query->pluck($key);
+
+            if ($keys->isEmpty()) {
+                break;
+            }
+
+            $last = $keys->last();
+            $bounds->push($last);
+        } while ($keys->count() === $chunkSize);
+
+        if ($bounds->isEmpty()) {
             return collect();
         }
 
-        // The last key of every chunk is its inclusive upper bound; the upper
-        // bound of the previous chunk is this chunk's exclusive lower bound.
-        // Using real keys (not arithmetic offsets) keeps the ranges correct
-        // even when keys are sparse because of deletes, and lets each chunk
-        // stage run independently on a queue with no shared cursor state.
-        $bounds = $keys->chunk($chunkSize)->map->last()->values();
-
+        // Using real keys (not arithmetic offsets) keeps the ranges correct even
+        // when keys are sparse because of deletes, and lets each chunk stage run
+        // independently on a queue with no shared cursor state.
         return $bounds->map(function ($end, $index) use ($bounds) {
             $start = $index === 0 ? null : $bounds->get($index - 1);
             $chunkScope = new ChunkScope($start, $end);
