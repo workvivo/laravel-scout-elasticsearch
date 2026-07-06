@@ -49,7 +49,10 @@ final class DefaultImportSource implements ImportSource
 
     public function chunked(): Collection
     {
-        $chunkSize = (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
+        // Guard against a misconfigured chunk size: 0 or a negative value would
+        // make limit($chunkSize) return nothing, leaving $bounds empty and
+        // silently importing into an empty index.
+        $chunkSize = max(1, (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE));
         $key = $this->model()->getQualifiedKeyName();
 
         // Build the chunk boundaries by seeking through the primary keys rather

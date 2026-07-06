@@ -93,6 +93,25 @@ class DefaultImportSourceTest extends TestCase
         $this->assertCount(9, $importedKeys);
     }
 
+    public function test_chunked_does_not_silently_skip_rows_when_chunk_size_is_non_positive()
+    {
+        // A misconfigured chunk size must not produce zero chunks (which would
+        // import into an empty index); it falls back to a chunk size of 1.
+        $this->app['config']->set('scout.chunk.searchable', 0);
+        $this->createProducts(3);
+
+        $chunks = (new DefaultImportSource(Product::class))->chunked();
+
+        $this->assertCount(3, $chunks);
+
+        $importedKeys = $chunks
+            ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()->modelKeys())
+            ->sort()
+            ->values();
+
+        $this->assertEquals(Product::orderBy('id')->pluck('id')->all(), $importedKeys->all());
+    }
+
     /**
      * Regression test: a model global scope that adds an ORDER BY on a column
      * other than the primary key must not break chunking. Keyset boundaries are
