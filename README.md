@@ -224,6 +224,19 @@ php artisan scout:import "App\Models\Product" --parallel --force
 then migrate) and the `queue.batching` config — the same requirement as any
 Laravel batch.
 
+By default `--parallel` dispatches and returns immediately (the work runs on your
+workers). Add `--wait` to block and watch a **chunk-based** progress bar, then get
+a summary (documents indexed, chunk count, elapsed time; non-zero exit if any
+chunk failed):
+
+```
+php artisan scout:import "App\Models\Product" --parallel --wait
+```
+
+`--wait` polls the batch, so it needs workers running to make progress. If no
+worker picks the batch up within `elasticsearch.import.wait_timeout` (default
+120s / `SCOUT_IMPORT_WAIT_TIMEOUT`) it reports the work as still queued and exits.
+
 #### Concurrent imports
 
 Chunk boundaries are frozen into each job at dispatch time (keyset seek, not offset),

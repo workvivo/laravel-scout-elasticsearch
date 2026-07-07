@@ -7,6 +7,8 @@ namespace Matchish\ScoutElasticSearch\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
 use Matchish\ScoutElasticSearch\ElasticSearch\Config\Config;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
 use Matchish\ScoutElasticSearch\ImportLock;
@@ -19,10 +21,17 @@ use Matchish\ScoutElasticSearch\Jobs\Stages\CreateWriteIndex;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
+use OpenSearch\Client;
 
 final class ImportCommand extends Command
 {
     const DEFAULT_LOCK_TTL = 3600;
+
+    /**
+     * Seconds --wait will poll for the batch to be created (prepare stages +
+     * DispatchPullBatch) before giving up and leaving the work queued.
+     */
+    const DEFAULT_WAIT_TIMEOUT = 120;
 
     /**
      * @inheritdoc
@@ -31,7 +40,8 @@ final class ImportCommand extends Command
         {--parallel : Import chunks in parallel across queue workers}
         {--queue= : Queue the import jobs run on (defaults to scout.queue, then the app default queue)}
         {--connection= : Queue connection the import jobs run on (defaults to scout.queue, then the app default queue)}
-        {--force : Run --parallel even when the resolved queue connection is synchronous}';
+        {--force : Run --parallel even when the resolved queue connection is synchronous}
+        {--wait : With --parallel, block and show a chunk progress bar until the import finishes}';
     /**
      * @inheritdoc
      */
@@ -59,12 +69,20 @@ final class ImportCommand extends Command
             }
         }
 
+        if ($this->option('wait') && ! $this->option('parallel')) {
+            $this->warn(trans('scout::import.wait_needs_parallel'));
+        }
+
+        $failed = false;
+
         $this->searchableList((array) $this->argument('searchable'))
-        ->each(function ($searchable) {
-            $this->import($searchable);
+        ->each(function ($searchable) use (&$failed) {
+            if ($this->import($searchable) === self::FAILURE) {
+                $failed = true;
+            }
         });
 
-        return self::SUCCESS;
+        return $failed ? self::FAILURE : self::SUCCESS;
     }
 
     /**
@@ -107,7 +125,7 @@ final class ImportCommand extends Command
         });
     }
 
-    private function import(string $searchable): void
+    private function import(string $searchable): int
     {
         $sourceFactory = app(ImportSourceFactory::class);
         $source = $sourceFactory::from($searchable);
@@ -117,11 +135,11 @@ final class ImportCommand extends Command
 
         // Another import for this exact model is already running. Skip this one
         // rather than racing its alias swap. Different models are unaffected —
-        // each holds its own key.
+        // each holds its own key. A skip is not a failure.
         if ($owner === null) {
             $this->warn(trans('scout::import.already_running', ['searchable' => $searchable]));
 
-            return;
+            return self::SUCCESS;
         }
 
         // Once dispatch hands the lock to the pipeline, the pipeline owns
@@ -135,28 +153,145 @@ final class ImportCommand extends Command
 
             if ($this->option('parallel')) {
                 // Resolve independently of scout.queue so parallel imports can
-                // use the app's default (e.g. SQS) queue on their own.
-                $this->dispatchParallel($source, $this->resolvedConnection(), $this->resolvedQueue(), $owner, $ttl);
-                $doneKey = 'scout::import.done.queue';
-            } else {
-                // Sequential path is unchanged: scout.queue decides queued vs
-                // inline, and per-model overrides are honoured. null falls back
-                // to the queue driver's default.
-                $connection = $this->option('connection') ?: $source->syncWithSearchUsing();
-                $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
-                $this->dispatchSequential($source, $connection, $queue, $owner, $ttl);
-                $doneKey = config('scout.queue') ? 'scout::import.done.queue' : 'scout::import.done';
+                // use the app's default (e.g. SQS) queue on their own. When
+                // --wait is set, a token lets us find and poll the batch.
+                $token = $this->option('wait') ? (string) Str::uuid() : null;
+                $this->dispatchParallel($source, $this->resolvedConnection(), $this->resolvedQueue(), $owner, $ttl, $token);
+                $handedOff = true;
+
+                if ($token !== null) {
+                    return $this->waitForBatch($searchable, $token);
+                }
+
+                $this->output->success(trans('scout::import.done.queue', ['searchable' => $searchable]));
+
+                return self::SUCCESS;
             }
 
+            // Sequential path is unchanged: scout.queue decides queued vs
+            // inline, and per-model overrides are honoured. null falls back
+            // to the queue driver's default.
+            $connection = $this->option('connection') ?: $source->syncWithSearchUsing();
+            $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
+            $this->dispatchSequential($source, $connection, $queue, $owner, $ttl);
             $handedOff = true;
 
-            $doneMessage = trans($doneKey, ['searchable' => $searchable]);
-            $this->output->success($doneMessage);
+            $doneKey = config('scout.queue') ? 'scout::import.done.queue' : 'scout::import.done';
+            $this->output->success(trans($doneKey, ['searchable' => $searchable]));
+
+            return self::SUCCESS;
         } finally {
             if (! $handedOff) {
                 ImportLock::release($source->searchableAs(), $owner);
             }
         }
+    }
+
+    /**
+     * Block until a --parallel batch finishes, rendering a progress bar over its
+     * chunks, then print a summary. Returns FAILURE when any chunk failed.
+     */
+    private function waitForBatch(string $searchable, string $token): int
+    {
+        $key = DispatchPullBatch::progressKey($token);
+        $start = microtime(true);
+        $appearTimeout = (int) config('elasticsearch.import.wait_timeout', self::DEFAULT_WAIT_TIMEOUT);
+
+        // Wait for the worker to run the prepare stages + DispatchPullBatch and
+        // publish the batch id. If nothing shows up, the work is still queued —
+        // report that rather than blocking forever (e.g. no worker running).
+        $record = null;
+        while (($record = Cache::get($key)) === null) {
+            if (microtime(true) - $start > $appearTimeout) {
+                $this->warn(trans('scout::import.wait_no_batch', ['searchable' => $searchable]));
+
+                return self::SUCCESS;
+            }
+            usleep(500000);
+        }
+
+        if (! empty($record['empty'])) {
+            $this->output->success(trans('scout::import.wait_summary_empty', ['searchable' => $searchable]));
+
+            return self::SUCCESS;
+        }
+
+        $batchId = $record['batchId'];
+        $indexName = $record['index'] ?? null;
+
+        $batch = Bus::findBatch($batchId);
+        $bar = $this->output->createProgressBar($batch !== null ? $batch->totalJobs : (int) ($record['total'] ?? 0));
+        $bar->start();
+
+        while ($batch !== null && ! $batch->finished()) {
+            $bar->setProgress($batch->processedJobs());
+            usleep(500000);
+            $batch = Bus::findBatch($batchId);
+        }
+
+        if ($batch !== null) {
+            $bar->setProgress($batch->processedJobs());
+        }
+        $bar->finish();
+        $this->newLine();
+
+        $elapsed = $this->humanElapsed(microtime(true) - $start);
+        $failed = $batch !== null ? $batch->failedJobs : 0;
+        $total = $batch !== null ? $batch->totalJobs : (int) ($record['total'] ?? 0);
+
+        if ($failed > 0 || ($batch !== null && $batch->cancelled())) {
+            $this->error(trans('scout::import.wait_failed', [
+                'searchable' => $searchable,
+                'failed' => $failed,
+                'chunks' => $total,
+                'elapsed' => $elapsed,
+            ]));
+
+            return self::FAILURE;
+        }
+
+        $indexed = $indexName !== null ? $this->countIndexedDocuments($indexName) : null;
+        $this->output->success(trans('scout::import.wait_summary', [
+            'searchable' => $searchable,
+            'indexed' => $indexed ?? '?',
+            'chunks' => $total,
+            'elapsed' => $elapsed,
+        ]));
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Count documents in the freshly built index by its concrete name, so the
+     * total is independent of the alias swap timing. Best effort — returns null
+     * if the index is unavailable.
+     */
+    private function countIndexedDocuments(string $index): ?int
+    {
+        try {
+            $client = app(Client::class);
+            $client->indices()->refresh(['index' => $index]);
+
+            return (int) ($client->count(['index' => $index])['count'] ?? 0);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function humanElapsed(float $seconds): string
+    {
+        $seconds = (int) round($seconds);
+
+        if ($seconds < 60) {
+            return $seconds.'s';
+        }
+
+        $minutes = intdiv($seconds, 60);
+        if ($minutes < 60) {
+            return $minutes.'m '.($seconds % 60).'s';
+        }
+
+        return intdiv($minutes, 60).'h '.($minutes % 60).'m';
     }
 
     private function dispatchSequential(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl): void
@@ -175,7 +310,7 @@ final class ImportCommand extends Command
         dispatch($job)->allOnQueue($queue)->allOnConnection($connection);
     }
 
-    private function dispatchParallel(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl): void
+    private function dispatchParallel(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, ?string $progressToken = null): void
     {
         $index = Index::fromSource($source);
         $timeout = Config::queueTimeout();
@@ -183,7 +318,7 @@ final class ImportCommand extends Command
         $stages = [
             new StageJob(new CleanUp($source)),
             new StageJob(new CreateWriteIndex($source, $index)),
-            new DispatchPullBatch($source, $index, $connection, $queue, $owner, $ttl),
+            new DispatchPullBatch($source, $index, $connection, $queue, $owner, $ttl, $progressToken),
         ];
 
         foreach ($stages as $stage) {

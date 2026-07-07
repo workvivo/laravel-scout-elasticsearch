@@ -11,6 +11,7 @@ use Matchish\ScoutElasticSearch\Console\Commands\ImportCommand;
 use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
 use Matchish\ScoutElasticSearch\Jobs\StageJob;
 use stdClass;
+use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\IntegrationTestCase;
 
 final class ParallelImportCommandTest extends IntegrationTestCase
@@ -168,6 +169,64 @@ final class ParallelImportCommandTest extends IntegrationTestCase
             StageJob::class,
             DispatchPullBatch::class,
         ]);
+    }
+
+    /**
+     * @test
+     */
+    public function wait_shows_progress_and_prints_a_summary_with_indexed_count(): void
+    {
+        $this->useSyncQueue();
+
+        $productsAmount = 10; // chunk size 3 => 4 chunks
+        $this->withoutModelEvents(Product::class, function () use ($productsAmount) {
+            factory(Product::class, $productsAmount)->create();
+        });
+
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call(
+            'scout:import',
+            ['searchable' => [Product::class], '--parallel' => true, '--force' => true, '--wait' => true],
+            $output
+        );
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertEquals($productsAmount, $this->searchTotal((new Product())->searchableAs()));
+
+        // Summary reports the indexed count and the chunk total, not "dispatched".
+        $text = $output->fetch();
+        $this->assertStringContainsString('10 documents', $text);
+        $this->assertStringContainsString('4 chunks', $text);
+    }
+
+    /**
+     * @test
+     */
+    public function wait_on_an_empty_model_reports_nothing_to_import(): void
+    {
+        $this->useSyncQueue();
+
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call(
+            'scout:import',
+            ['searchable' => [Product::class], '--parallel' => true, '--force' => true, '--wait' => true],
+            $output
+        );
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertStringContainsString('no records', $output->fetch());
+    }
+
+    /**
+     * @test
+     */
+    public function wait_without_parallel_warns_and_is_ignored(): void
+    {
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--wait' => true], $output);
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertStringContainsString('only applies to --parallel', $output->fetch());
     }
 
     /**

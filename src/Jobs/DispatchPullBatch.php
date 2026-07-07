@@ -9,6 +9,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
 use Matchish\ScoutElasticSearch\ImportLock;
 use Matchish\ScoutElasticSearch\Jobs\Stages\PullFromSource;
@@ -60,6 +61,14 @@ final class DispatchPullBatch implements ShouldQueue
      * @var int
      */
     private $lockTtl;
+    /**
+     * Correlation token for `--wait`: when set, the created batch id and target
+     * index are published to the cache so the dispatching command can find the
+     * batch and poll its progress. Null when nobody is waiting.
+     *
+     * @var string|null
+     */
+    private $progressToken;
 
     public ?int $timeout = null;
 
@@ -69,7 +78,8 @@ final class DispatchPullBatch implements ShouldQueue
         ?string $connection,
         ?string $queue,
         ?string $lockOwner = null,
-        int $lockTtl = 3600
+        int $lockTtl = 3600,
+        ?string $progressToken = null
     ) {
         $this->source = $source;
         $this->index = $index;
@@ -77,6 +87,12 @@ final class DispatchPullBatch implements ShouldQueue
         $this->batchQueue = $queue;
         $this->lockOwner = $lockOwner;
         $this->lockTtl = $lockTtl;
+        $this->progressToken = $progressToken;
+    }
+
+    public static function progressKey(string $token): string
+    {
+        return 'scout:import:progress:'.$token;
     }
 
     public function handle(): void
@@ -96,6 +112,7 @@ final class DispatchPullBatch implements ShouldQueue
         $searchableAs = $source->searchableAs();
         $owner = $this->lockOwner;
         $ttl = $this->lockTtl;
+        $progressKey = $this->progressToken !== null ? self::progressKey($this->progressToken) : null;
 
         // Building chunk bounds scans the key column and can take a while on a
         // large table; renew the lease now so it does not expire before the
@@ -108,6 +125,9 @@ final class DispatchPullBatch implements ShouldQueue
         // which still promotes an empty index, then free the lock.
         if (empty($chunkJobs)) {
             self::finalize($source, $index);
+            if ($progressKey !== null) {
+                Cache::put($progressKey, ['empty' => true, 'index' => $index->name()], $ttl);
+            }
             if ($owner !== null) {
                 ImportLock::release($searchableAs, $owner);
             }
@@ -153,7 +173,18 @@ final class DispatchPullBatch implements ShouldQueue
             $batch->onQueue($this->batchQueue);
         }
 
-        $batch->dispatch();
+        $dispatched = $batch->dispatch();
+
+        // Hand the batch id and target index to a waiting command so it can poll
+        // progress. Chunk count = totalJobs. (On the sync driver the batch has
+        // already finished here; the waiter detects that via findBatch.)
+        if ($progressKey !== null) {
+            Cache::put($progressKey, [
+                'batchId' => $dispatched->id,
+                'total' => $dispatched->totalJobs,
+                'index' => $index->name(),
+            ], $ttl);
+        }
     }
 
     private static function finalize(ImportSource $source, Index $index): void

@@ -18,6 +18,10 @@ return [
         // index. Requires a cache store with atomic add (redis, memcached,
         // database, dynamodb) — the file driver is unsuitable.
         'lock_ttl' => (int) env('SCOUT_IMPORT_LOCK_TTL', 3600),
+        // Seconds `scout:import --parallel --wait` polls for the batch to be
+        // created before giving up and leaving the work queued (e.g. when no
+        // worker is running to pick it up).
+        'wait_timeout' => (int) env('SCOUT_IMPORT_WAIT_TIMEOUT', 120),
     ],
     'indices' => [
         'mappings' => [
