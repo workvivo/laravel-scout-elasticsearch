@@ -268,6 +268,35 @@ final class ParallelImportCommandTest extends IntegrationTestCase
     /**
      * @test
      */
+    public function wait_timeout_names_the_resolved_connection_and_queue(): void
+    {
+        // No worker is running — Bus::fake() shelves the chain, so the batch
+        // record never appears and the wait must give up. wait_timeout=0 makes
+        // it give up on the first poll.
+        $this->useAsyncDefaultQueue();
+        $this->app['config']->set('elasticsearch.import.wait_timeout', 0);
+        Bus::fake();
+
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call(
+            'scout:import',
+            ['searchable' => [Product::class], '--parallel' => true, '--wait' => true, '--queue' => 'reindex'],
+            $output
+        );
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $text = $output->fetch();
+
+        // Explicit --queue is echoed verbatim; connection falls through to the
+        // resolved app default (async_test from useAsyncDefaultQueue).
+        $this->assertStringContainsString('connection [async_test]', $text);
+        $this->assertStringContainsString('queue [reindex]', $text);
+        $this->assertStringContainsString('SCOUT_IMPORT_WAIT_TIMEOUT', $text);
+    }
+
+    /**
+     * @test
+     */
     public function parallel_switches_alias_and_removes_old_index(): void
     {
         $this->useSyncQueue();

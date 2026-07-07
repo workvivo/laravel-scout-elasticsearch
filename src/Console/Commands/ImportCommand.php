@@ -176,12 +176,14 @@ final class ImportCommand extends Command
                 // Resolve independently of scout.queue so parallel imports can
                 // use the app's default (e.g. SQS) queue on their own. When
                 // --wait is set, a token lets us find and poll the batch.
+                $connection = $this->resolvedConnection();
+                $queue = $this->resolvedQueue();
                 $token = $this->option('wait') ? (string) Str::uuid() : null;
-                $this->dispatchParallel($source, $this->resolvedConnection(), $this->resolvedQueue(), $owner, $ttl, $token);
+                $this->dispatchParallel($source, $connection, $queue, $owner, $ttl, $token);
                 $handedOff = true;
 
                 if ($token !== null) {
-                    return $this->waitForBatch($searchable, $token);
+                    return $this->waitForBatch($searchable, $token, $connection, $queue);
                 }
 
                 $this->output->success(trans('scout::import.done.queue', ['searchable' => $searchable]));
@@ -224,7 +226,7 @@ final class ImportCommand extends Command
      * Block until a --parallel batch finishes, rendering a progress bar over its
      * chunks, then print a summary. Returns FAILURE when any chunk failed.
      */
-    private function waitForBatch(string $searchable, string $token): int
+    private function waitForBatch(string $searchable, string $token, ?string $connection, ?string $queue): int
     {
         $key = DispatchPullBatch::progressKey($token);
         $start = microtime(true);
@@ -246,7 +248,14 @@ final class ImportCommand extends Command
                 $announced = true;
             }
             if (microtime(true) - $start > $appearTimeout) {
-                $this->warn(trans('scout::import.wait_no_batch', ['searchable' => $searchable]));
+                $this->warn(trans('scout::import.wait_no_batch', [
+                    'searchable' => $searchable,
+                    'connection' => $connection ?? '(driver default)',
+                    'queue' => $queue ?? '(driver default)',
+                    'elapsed' => (int) round(microtime(true) - $start),
+                    'timeout' => $appearTimeout,
+                ]));
+                $this->line(trans('scout::import.wait_no_batch_hint'));
 
                 return self::SUCCESS;
             }

@@ -372,5 +372,47 @@ In this case you need to implement your own implementation of `HitsIteratorAggre
 
 [Here is a case](https://github.com/matchish/laravel-scout-elasticsearch/issues/28)
 
+## :hammer_and_wrench: Local development
+
+To work on the package against a real Laravel app without publishing to Packagist,
+point the app at your local clone via a Composer `path` repository. In the
+app's `composer.json`, add to `repositories`:
+
+```json
+{
+    "type": "path",
+    "url": "/absolute/path/to/laravel-scout-elasticsearch",
+    "options": { "symlink": true }
+}
+```
+
+Then require it as a `@dev` version:
+
+```
+composer require "matchish/laravel-scout-elasticsearch:*@dev"
+```
+
+`symlink: true` means edits in the package repo are picked up by the app
+immediately — no `composer update` after each change. Drop the option (or set
+it to `false`) to have Composer copy files instead, useful when your host does
+not follow symlinks (e.g. some Docker bind-mount setups).
+
+To test a branch from the fork without cloning, use a `vcs` repository and a
+`dev-<branch>` constraint:
+
+```json
+{
+    "type": "vcs",
+    "url": "https://github.com/workvivo/laravel-scout-elasticsearch"
+}
+```
+
+```
+composer require "matchish/laravel-scout-elasticsearch:dev-<branch-name>"
+```
+
+Add `@dev` to the constraint (`dev-<branch>@dev`) if Composer complains about
+stability without changing the app's global `minimum-stability`.
+
 ## :free: License
 Scout ElasticSearch is an open-sourced software licensed under the [MIT license](LICENSE.md).
