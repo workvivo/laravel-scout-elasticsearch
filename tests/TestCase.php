@@ -124,6 +124,9 @@ abstract class TestCase extends BaseTestCase
         $app['config']->set('scout.driver', ElasticSearchEngine::class);
         $app['config']->set('scout.chunk.searchable', 3);
         $app['config']->set('scout.queue', false);
+        // The array store supports atomic locks, which the per-model import
+        // duplicate-run guard relies on.
+        $app['config']->set('cache.default', 'array');
 
         $app['config']->set('database.connections.sqlite', [
             'driver' => 'sqlite',

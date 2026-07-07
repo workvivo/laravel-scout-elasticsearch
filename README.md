@@ -187,6 +187,46 @@ While working in production, to keep your existing search experience available w
 
 The command create new temporary index, import all models to it, and then switch to the index and remove old index.
 
+#### Parallel import
+
+Imports run chunk by chunk in a single job by default. On large tables you can fan the
+chunks out across your queue workers with `--parallel`:
+
+```
+php artisan scout:import "App\Models\Product" --parallel
+```
+
+Each chunk (a keyset key-range, see below) becomes its own batched job, so many
+"pages" of the same model are pulled and indexed at once. The alias is only
+swapped to the new index once every chunk succeeds; if any chunk fails, the old
+index keeps serving, the failure is reported, and the half-filled new index is
+removed so it does not linger on the cluster.
+
+`--parallel` requires a configured queue (`scout.queue`). By default the batch runs
+on the connection/queue from that config; override per run with `--connection` and
+`--queue` (handy for routing a big reindex onto a dedicated queue):
+
+```
+php artisan scout:import "App\Models\Product" --parallel --connection=redis --queue=reindex
+```
+
+#### Concurrent imports
+
+Chunk boundaries are frozen into each job at dispatch time (keyset seek, not offset),
+so imports for **different** models are fully isolated and safe to run at the same
+time. To stop a second run for the **same** model from racing the alias swap, a
+per-model lock is taken while an import is in flight — a second `scout:import` for a
+model already being imported is skipped with a warning.
+
+The lock is a **renewable lease**: the running import extends it as each chunk
+completes, so the TTL (`elasticsearch.import.lock_ttl`, default 3600s /
+`SCOUT_IMPORT_LOCK_TTL`) is an *inactivity* timeout, not a cap on total import
+time. This matters for large tables — a multi-hour import stays locked the whole
+time as long as it keeps making progress, while a crashed run self-heals after
+one idle TTL window. Set the TTL comfortably above the time a single chunk takes
+to index. It needs a cache store with atomic `add` (`redis`, `memcached`,
+`database`, or `dynamodb` — **not** the `file` driver).
+
 ### Search
 
 To be fully compatible with original scout package, this package does not add new methods.
