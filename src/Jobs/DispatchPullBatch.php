@@ -70,6 +70,15 @@ final class DispatchPullBatch implements ShouldQueue
      */
     private $progressToken;
 
+    /**
+     * When true, each fanned-out chunk logs a fetch/filter/index timing
+     * breakdown (see {@see PullFromSource}). Carried onto the batch jobs so the
+     * flag survives serialization to the workers.
+     *
+     * @var bool
+     */
+    private $profile;
+
     public ?int $timeout = null;
 
     public function __construct(
@@ -79,7 +88,8 @@ final class DispatchPullBatch implements ShouldQueue
         ?string $queue,
         ?string $lockOwner = null,
         int $lockTtl = 3600,
-        ?string $progressToken = null
+        ?string $progressToken = null,
+        bool $profile = false
     ) {
         $this->source = $source;
         $this->index = $index;
@@ -88,6 +98,7 @@ final class DispatchPullBatch implements ShouldQueue
         $this->lockOwner = $lockOwner;
         $this->lockTtl = $lockTtl;
         $this->progressToken = $progressToken;
+        $this->profile = $profile;
     }
 
     public static function progressKey(string $token): string
@@ -95,10 +106,32 @@ final class DispatchPullBatch implements ShouldQueue
         return 'scout:import:progress:'.$token;
     }
 
+    /**
+     * Cache key for the prepare-phase heartbeat the chain publishes while it
+     * cleans up, creates the write index, and plans chunks — before the batch
+     * (and therefore {@see progressKey}) exists. Lets a --wait command tell a
+     * chain that is being actively worked from one still queued.
+     */
+    public static function preparingKey(string $token): string
+    {
+        return 'scout:import:preparing:'.$token;
+    }
+
     public function handle(): void
     {
+        // Third prepare heartbeat: planning is the last step before the batch
+        // exists, and on a large table without --fast-plan the key scan is the
+        // slow part, so publish "planning" before it starts. seq 1 (clean up)
+        // and 2 (create index) are published by the preceding StageJobs.
+        if ($this->progressToken !== null) {
+            Cache::put(self::preparingKey($this->progressToken), [
+                'seq' => 3,
+                'stage' => 'Planning chunks',
+            ], $this->lockTtl);
+        }
+
         $timeout = $this->timeout;
-        $chunkJobs = PullFromSource::chunked($this->source)
+        $chunkJobs = PullFromSource::chunked($this->source, $this->profile)
             ->map(function ($stage) use ($timeout) {
                 $job = new StageJob($stage);
                 $job->timeout = $timeout;

@@ -44,7 +44,8 @@ final class ImportCommand extends Command
         {--force : Run --parallel even when the resolved queue connection is synchronous}
         {--wait : With --parallel, block and show a chunk progress bar until the import finishes}
         {--chunk= : Rows per chunk for this run (overrides the scout.chunk.searchable config)}
-        {--fast-plan : Plan chunk boundaries from bare keys, skipping the eager-load join/filters (faster on joined models)}';
+        {--fast-plan : Plan chunk boundaries from bare keys, skipping the eager-load join/filters (faster on joined models)}
+        {--profile : Log a per-chunk fetch/filter/index timing breakdown to help diagnose slow chunks}';
     /**
      * @inheritdoc
      */
@@ -183,7 +184,7 @@ final class ImportCommand extends Command
                 $connection = $this->resolvedConnection();
                 $queue = $this->resolvedQueue();
                 $token = $this->option('wait') ? (string) Str::uuid() : null;
-                $this->dispatchParallel($source, $connection, $queue, $owner, $ttl, $token);
+                $this->dispatchParallel($source, $connection, $queue, $owner, $ttl, $token, (bool) $this->option('profile'));
                 $handedOff = true;
 
                 if ($token !== null) {
@@ -202,7 +203,7 @@ final class ImportCommand extends Command
             $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
 
             $start = microtime(true);
-            $this->dispatchSequential($source, $connection, $queue, $owner, $ttl);
+            $this->dispatchSequential($source, $connection, $queue, $owner, $ttl, (bool) $this->option('profile'));
             $handedOff = true;
 
             // Queued sequential is fire-and-forget (runs on a worker), so it can
@@ -233,36 +234,65 @@ final class ImportCommand extends Command
     private function waitForBatch(string $searchable, string $token, ?string $connection, ?string $queue): int
     {
         $key = DispatchPullBatch::progressKey($token);
+        $prepareKey = DispatchPullBatch::preparingKey($token);
         $start = microtime(true);
         $appearTimeout = (int) config('elasticsearch.import.wait_timeout', self::DEFAULT_WAIT_TIMEOUT);
 
         // Wait for the worker to run the prepare stages + DispatchPullBatch and
-        // publish the batch id. There is an unavoidable gap here: a worker has
-        // to pick up the chain, clean up + create the new index, and scan the
-        // primary keys to plan the chunks before the batch (and its job count)
-        // exists — that key scan is the bulk of the wait on a large table. Show
-        // a "preparing" note so the pause is explained, and if nothing shows up
-        // before the timeout, report the work as still queued rather than
-        // blocking forever (e.g. no worker running).
+        // publish the batch id. A worker first has to pick up the chain, clean
+        // up + create the new index, and scan the primary keys to plan the
+        // chunks before the batch exists.
+        //
+        // The timeout is applied to the time since the last *observed activity*,
+        // not since dispatch: each prepare stage publishes a heartbeat as it
+        // begins (see StageJob::withHeartbeat + DispatchPullBatch), so a chain
+        // that is actively progressing keeps resetting the window and never
+        // false-times-out just because a busy queue took a while to schedule
+        // each hop. Two distinct give-up cases: never picked up (no heartbeat
+        // ever — likely no worker on this queue, or a very deep backlog) vs.
+        // picked up then went silent (a slow stage, or a crashed/OOM worker).
         $record = null;
-        $announced = false;
+        $lastActivity = $start;
+        $lastSeq = null;
+        $lastStage = null;
+        $pickedUp = false;
+
         while (($record = Cache::get($key)) === null) {
-            if (! $announced) {
-                $this->comment(trans('scout::import.wait_preparing', ['searchable' => $searchable]));
-                $announced = true;
-            }
-            if (microtime(true) - $start > $appearTimeout) {
-                $this->warn(trans('scout::import.wait_no_batch', [
+            $beat = Cache::get($prepareKey);
+            if ($beat !== null && ($beat['seq'] ?? null) !== $lastSeq) {
+                $lastSeq = $beat['seq'] ?? null;
+                $lastStage = $beat['stage'] ?? null;
+                $lastActivity = microtime(true);
+                $pickedUp = true;
+                $this->comment(trans('scout::import.wait_preparing', [
                     'searchable' => $searchable,
-                    'connection' => $connection ?? '(driver default)',
-                    'queue' => $queue ?? '(driver default)',
-                    'elapsed' => (int) round(microtime(true) - $start),
-                    'timeout' => $appearTimeout,
+                    'stage' => $lastStage ?? '…',
                 ]));
-                $this->line(trans('scout::import.wait_no_batch_hint'));
+            }
+
+            if (microtime(true) - $lastActivity > $appearTimeout) {
+                $silence = (int) round(microtime(true) - $lastActivity);
+                if ($pickedUp) {
+                    $this->warn(trans('scout::import.wait_prepare_stalled', [
+                        'searchable' => $searchable,
+                        'stage' => $lastStage ?? '?',
+                        'elapsed' => $silence,
+                    ]));
+                    $this->line(trans('scout::import.wait_prepare_stalled_hint'));
+                } else {
+                    $this->warn(trans('scout::import.wait_no_pickup', [
+                        'searchable' => $searchable,
+                        'connection' => $connection ?? '(driver default)',
+                        'queue' => $queue ?? '(driver default)',
+                        'elapsed' => $silence,
+                        'timeout' => $appearTimeout,
+                    ]));
+                    $this->line(trans('scout::import.wait_no_pickup_hint'));
+                }
 
                 return self::SUCCESS;
             }
+
             usleep(500000);
         }
 
@@ -352,9 +382,9 @@ final class ImportCommand extends Command
         return intdiv($minutes, 60).'h '.($minutes % 60).'m';
     }
 
-    private function dispatchSequential(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl): void
+    private function dispatchSequential(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, bool $profile = false): void
     {
-        $job = new Import($source, $owner, $ttl);
+        $job = new Import($source, $owner, $ttl, $profile);
         $job->timeout = Config::queueTimeout();
 
         if (config('scout.queue')) {
@@ -368,15 +398,28 @@ final class ImportCommand extends Command
         dispatch($job)->allOnQueue($queue)->allOnConnection($connection);
     }
 
-    private function dispatchParallel(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, ?string $progressToken = null): void
+    private function dispatchParallel(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, ?string $progressToken = null, bool $profile = false): void
     {
         $index = Index::fromSource($source);
         $timeout = Config::queueTimeout();
 
+        $cleanUp = new StageJob(new CleanUp($source));
+        $createIndex = new StageJob(new CreateWriteIndex($source, $index));
+
+        // With --wait, the prepare stages publish a heartbeat as each begins so
+        // waitForBatch can see the chain has been picked up and is progressing
+        // (clean up = 1, create index = 2; DispatchPullBatch publishes 3 for
+        // planning). Without --wait nobody polls, so skip the writes.
+        if ($progressToken !== null) {
+            $prepareKey = DispatchPullBatch::preparingKey($progressToken);
+            $cleanUp->withHeartbeat($prepareKey, 1, $ttl);
+            $createIndex->withHeartbeat($prepareKey, 2, $ttl);
+        }
+
         $stages = [
-            new StageJob(new CleanUp($source)),
-            new StageJob(new CreateWriteIndex($source, $index)),
-            new DispatchPullBatch($source, $index, $connection, $queue, $owner, $ttl, $progressToken),
+            $cleanUp,
+            $createIndex,
+            new DispatchPullBatch($source, $index, $connection, $queue, $owner, $ttl, $progressToken, $profile),
         ];
 
         foreach ($stages as $stage) {

@@ -40,18 +40,28 @@ final class Import
      */
     private $lockTtl;
 
+    /**
+     * When true, each chunk logs a fetch/filter/index timing breakdown (see
+     * {@see \Matchish\ScoutElasticSearch\Jobs\Stages\PullFromSource}).
+     *
+     * @var bool
+     */
+    private $profile;
+
     public ?int $timeout = null;
 
     /**
      * @param  ImportSource  $source
      * @param  string|null  $lockOwner
      * @param  int  $lockTtl
+     * @param  bool  $profile
      */
-    public function __construct(ImportSource $source, ?string $lockOwner = null, int $lockTtl = 3600)
+    public function __construct(ImportSource $source, ?string $lockOwner = null, int $lockTtl = 3600, bool $profile = false)
     {
         $this->source = $source;
         $this->lockOwner = $lockOwner;
         $this->lockTtl = $lockTtl;
+        $this->profile = $profile;
     }
 
     /**
@@ -83,6 +93,6 @@ final class Import
 
     private function stages(): Collection
     {
-        return ImportStages::fromSource($this->source);
+        return ImportStages::fromSource($this->source, $this->profile);
     }
 }

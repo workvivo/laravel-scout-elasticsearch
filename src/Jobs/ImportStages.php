@@ -15,16 +15,17 @@ class ImportStages extends Collection
 {
     /**
      * @param  ImportSource  $source
+     * @param  bool  $profile
      * @return Collection
      */
-    public static function fromSource(ImportSource $source)
+    public static function fromSource(ImportSource $source, bool $profile = false)
     {
         $index = Index::fromSource($source);
 
         return (new self([
             new CleanUp($source),
             new CreateWriteIndex($source, $index),
-            PullFromSource::chunked($source),
+            PullFromSource::chunked($source, $profile),
             new RefreshIndex($index),
             new SwitchToNewAndRemoveOldIndex($source, $index),
         ]))->flatten()->filter();

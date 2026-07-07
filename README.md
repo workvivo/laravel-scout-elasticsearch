@@ -238,9 +238,18 @@ chunk failed):
 php artisan scout:import "App\Models\Product" --parallel --wait
 ```
 
-`--wait` polls the batch, so it needs workers running to make progress. If no
-worker picks the batch up within `elasticsearch.import.wait_timeout` (default
-120s / `SCOUT_IMPORT_WAIT_TIMEOUT`) it reports the work as still queued and exits.
+`--wait` polls the batch, so it needs workers running to make progress. The
+prepare chain (clean up → create index → plan chunks) publishes a heartbeat as
+each step runs, and `--wait` measures its timeout against the time since the
+**last observed step**, not since dispatch — so a chain that keeps progressing
+never times out just because a busy queue was slow to schedule each hop. The
+timeout (`elasticsearch.import.wait_timeout`, default 120s /
+`SCOUT_IMPORT_WAIT_TIMEOUT`) therefore bounds a single idle gap, and on giving up
+it distinguishes two cases: **no worker picked it up** (nothing ran within the
+window — check a worker is consuming that connection/queue, or raise the timeout
+on a deep backlog) versus **picked up but went silent** (a slow prepare stage, or
+a crashed/OOM worker). Either way the work stays queued and the command exits —
+a `--wait` timeout is not a failure; the import still runs on your workers.
 
 ##### Tuning chunk size and planning
 

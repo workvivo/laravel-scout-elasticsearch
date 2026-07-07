@@ -7,6 +7,7 @@ namespace Tests\Feature;
 use App\Product;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\Console\Commands\ImportCommand;
 use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
 use Matchish\ScoutElasticSearch\Jobs\StageJob;
@@ -270,9 +271,9 @@ final class ParallelImportCommandTest extends IntegrationTestCase
      */
     public function wait_timeout_names_the_resolved_connection_and_queue(): void
     {
-        // No worker is running — Bus::fake() shelves the chain, so the batch
-        // record never appears and the wait must give up. wait_timeout=0 makes
-        // it give up on the first poll.
+        // Bus::fake() shelves the chain, so no prepare heartbeat and no batch
+        // ever appear — the "never picked up" branch. wait_timeout=0 makes it
+        // give up on the first poll.
         $this->useAsyncDefaultQueue();
         $this->app['config']->set('elasticsearch.import.wait_timeout', 0);
         Bus::fake();
@@ -287,11 +288,57 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
         $text = $output->fetch();
 
-        // Explicit --queue is echoed verbatim; connection falls through to the
-        // resolved app default (async_test from useAsyncDefaultQueue).
+        // No heartbeat was ever seen, so it reports the "no worker picked it up"
+        // case, naming the resolved connection/queue. Explicit --queue is echoed
+        // verbatim; connection falls through to the resolved app default
+        // (async_test from useAsyncDefaultQueue).
+        $this->assertStringContainsString('no worker started', $text);
         $this->assertStringContainsString('connection [async_test]', $text);
         $this->assertStringContainsString('queue [reindex]', $text);
         $this->assertStringContainsString('SCOUT_IMPORT_WAIT_TIMEOUT', $text);
+    }
+
+    /**
+     * @test
+     */
+    public function wait_reports_a_stalled_prepare_when_the_chain_was_picked_up_then_went_silent(): void
+    {
+        // A heartbeat under the polled token means a worker picked up the chain;
+        // the batch never materialising after that is the "stalled prepare"
+        // case (slow stage, or crashed/OOM worker) — distinct from "no worker".
+        // waitForBatch is private and the command mints a random token, so drive
+        // it directly with a token whose heartbeat we seed.
+        $this->app['config']->set('elasticsearch.import.wait_timeout', 0);
+
+        $token = 'stalled-token';
+        Cache::put(
+            DispatchPullBatch::preparingKey($token),
+            ['seq' => 2, 'stage' => 'Create write index'],
+            60
+        );
+
+        $command = new ImportCommand();
+        $command->setLaravel($this->app);
+        $buffer = new BufferedOutput();
+        $outputProp = (new \ReflectionClass(\Illuminate\Console\Command::class))->getProperty('output');
+        $outputProp->setAccessible(true);
+        $outputProp->setValue(
+            $command,
+            new \Illuminate\Console\OutputStyle(new \Symfony\Component\Console\Input\ArrayInput([]), $buffer)
+        );
+
+        $waitForBatch = (new \ReflectionClass(ImportCommand::class))->getMethod('waitForBatch');
+        $waitForBatch->setAccessible(true);
+        $exit = $waitForBatch->invoke($command, 'App\Product', $token, 'redis', 'reindex');
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exit);
+        $text = $buffer->fetch();
+
+        // Reports the stalled case, names the stage it was last seen on, and
+        // does NOT fall back to the "no worker picked it up" wording.
+        $this->assertStringContainsString('Create write index', $text);
+        $this->assertStringContainsString('produced no batch', $text);
+        $this->assertStringNotContainsString('no worker started', $text);
     }
 
     /**
