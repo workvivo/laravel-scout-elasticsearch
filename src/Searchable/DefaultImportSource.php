@@ -96,26 +96,105 @@ final class DefaultImportSource implements ImportSource
         $chunkSize = max(1, (int) ($this->chunkSize ?? config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE)));
         $key = $this->model()->getQualifiedKeyName();
 
-        // Build the chunk boundaries by seeking through the primary keys rather
-        // than counting rows and paginating by offset. Each chunk then imports
-        // its slice with a key-range seek (WHERE key > ? AND key <= ?) instead
-        // of OFFSET, so keyset paging costs the same for the first chunk and the
-        // last one — imports no longer slow down as they progress through a
-        // large table.
-        //
-        // Only the key column is read, and only one chunk of keys is held at a
-        // time, so this stays O(chunk size) in memory instead of loading every
-        // primary key at once — safe on tables with millions of rows. Each
-        // boundary is the last key of a chunk (its inclusive upper bound) and
-        // becomes the exclusive lower bound of the next chunk. reorder() drops
-        // any competing ORDER BY (e.g. from a model global scope or
+        // Auto-increment integer PKs are the common case, and they let us plan
+        // chunk boundaries arithmetically from a single MIN/MAX aggregate —
+        // dramatically faster than the seek loop on tables with millions of
+        // rows (2 queries instead of one per chunk). Any other key shape
+        // (UUIDs, string keys, non-incrementing snowflake IDs) has no
+        // meaningful arithmetic step over its key-space, so we fall back to
+        // the seek loop which walks real keys.
+        return $this->canPlanArithmetically()
+            ? $this->chunkedArithmetic($key, $chunkSize)
+            : $this->chunkedSeek($key, $chunkSize);
+    }
+
+    /**
+     * True when chunk boundaries can be computed from `MIN/MAX(key) + N*chunk`
+     * arithmetic instead of walking real keys. Requires an incrementing
+     * integer primary key — Laravel's default. Models with `$incrementing =
+     * false` (e.g. snowflake IDs) or `$keyType = 'string'` (UUID / ULID)
+     * opt themselves out automatically.
+     */
+    private function canPlanArithmetically(): bool
+    {
+        $model = $this->model();
+
+        return $model->getKeyType() === 'int' && $model->getIncrementing() === true;
+    }
+
+    /**
+     * Arithmetic planning: one MIN + one MAX query, then N chunk boundaries
+     * generated in memory. Coverage is complete because the fetch still filters
+     * per-chunk; sparse keys just produce some lighter (or empty) chunks.
+     */
+    private function chunkedArithmetic(string $key, int $chunkSize): Collection
+    {
+        $planningQuery = $this->fastPlan ? $this->planningQuery() : $this->newQuery();
+
+        // Aggregate() internally strips orders/limits/offsets from the local
+        // builder, so any scope-injected ORDER BY that survives to execute
+        // time has no effect on a single-row aggregate result.
+        $min = $planningQuery->min($key);
+
+        if ($min === null) {
+            return collect();
+        }
+
+        // Defensive fallback: canPlanArithmetically() trusts the model's
+        // $keyType / $incrementing declaration, but some real-world codebases
+        // store UUIDs (or other non-numeric values) in a column while
+        // leaving those defaults at 'int'/true. Casting a UUID to int would
+        // silently produce garbage boundaries and index zero rows. Verify
+        // the actual value is numeric; if not, fall back to seek planning
+        // which walks real keys and works for any orderable column.
+        if (! is_numeric($min)) {
+            return $this->chunkedSeek($key, $chunkSize);
+        }
+
+        $max = $planningQuery->max($key);
+
+        $min = (int) $min;
+        $max = (int) $max;
+
+        // Boundaries are inclusive upper bounds. First chunk covers keys up to
+        // min+chunkSize-1, and each subsequent boundary steps by chunkSize
+        // until we reach (or pass) max. The final boundary is clamped to max
+        // so the last chunk always closes exactly on the highest real key.
+        $bounds = collect();
+        $upper = $min + $chunkSize - 1;
+        while ($upper < $max) {
+            $bounds->push($upper);
+            $upper += $chunkSize;
+        }
+        $bounds->push($max);
+
+        return $bounds->map(function ($end, $index) use ($bounds) {
+            $start = $index === 0 ? null : $bounds->get($index - 1);
+            $chunkScope = new ChunkScope($start, $end);
+
+            return new static($this->className, array_merge($this->scopes, [$chunkScope]), $this->chunkSize, $this->fastPlan);
+        });
+    }
+
+    /**
+     * Seek planning: walk the primary key in chunkSize-sized batches, capturing
+     * the last key of each batch as an inclusive upper bound. This is the
+     * general-purpose fallback for any key shape (string, UUID, sparse int),
+     * where arithmetic over key-space would either be undefined or produce
+     * pathologically many empty chunks.
+     */
+    private function chunkedSeek(string $key, int $chunkSize): Collection
+    {
+        // Only the key column is read, and only one chunk of keys is held at
+        // a time, so this stays O(chunk size) in memory instead of loading
+        // every primary key at once — safe on tables with millions of rows.
+        // reorder() drops any competing ORDER BY (e.g. from
         // makeAllSearchableUsing) that would otherwise make the key sequence
-        // non-monotonic and cause chunks to skip or duplicate rows.
-        //
-        // In fast-plan mode the boundaries come from a bare key query
-        // (planningQuery) that skips the eager-load join/filters; the per-chunk
-        // fetch still applies them, so ranges only widen and coverage is
-        // unchanged (see planningQuery()).
+        // non-monotonic and cause chunks to skip or duplicate rows. Model
+        // global scopes' ORDER BY clauses, added lazily by applyScopes at
+        // execute time, can still land here in non-fast-plan mode; the
+        // primary ORDER BY on the key stays leftmost so keyset ordering is
+        // preserved. In fast-plan mode planningQuery() already strips them.
         $bounds = collect();
         $last = null;
 
@@ -141,9 +220,6 @@ final class DefaultImportSource implements ImportSource
             return collect();
         }
 
-        // Using real keys (not arithmetic offsets) keeps the ranges correct even
-        // when keys are sparse because of deletes, and lets each chunk stage run
-        // independently on a queue with no shared cursor state.
         return $bounds->map(function ($end, $index) use ($bounds) {
             $start = $index === 0 ? null : $bounds->get($index - 1);
             $chunkScope = new ChunkScope($start, $end);

@@ -108,12 +108,14 @@ class DefaultImportSourceTest extends TestCase
         $joinAware = new DefaultImportSource(Post::class);
         $fast = (new DefaultImportSource(Post::class))->withFastPlan();
 
-        // The two strategies produce different chunk boundaries (chunk size 3:
-        // 6 published => 2 chunks vs 12 total => 4 chunks)...
-        $this->assertNotEquals($joinAware->chunked()->count(), $fast->chunked()->count());
-
-        // ...yet index exactly the same records — and exactly the published set,
-        // never a draft.
+        // Whether the two strategies produce different chunk counts is an
+        // implementation detail (seek planning over an interleaved published
+        // set gives fewer chunks; arithmetic planning over min..max gives the
+        // same count as the fast path). The invariant that matters is that
+        // both strategies index exactly the same records — the published set
+        // in full and never a draft — because the per-chunk fetch still runs
+        // makeAllSearchableUsing and shouldBeSearchable regardless of how
+        // wide the planned ranges are.
         $published = Post::where('status', 'published')->orderBy('id')->pluck('id')->all();
         $this->assertEquals($published, $indexedKeys($joinAware));
         $this->assertEquals($published, $indexedKeys($fast));
@@ -236,11 +238,14 @@ class DefaultImportSourceTest extends TestCase
     }
 
     /**
-     * Regression test: a model global scope that adds a WHERE clause turns the
-     * planning key scan into a filtered/joined scan on large tables. Fast-plan
-     * mode must strip global scopes at planning time so the key scan stays
-     * index-friendly; coverage stays complete because the per-chunk fetch
-     * still applies them.
+     * Regression test: a model global scope that adds a WHERE, JOIN, or extra
+     * ORDER BY turns the planning key scan into a filtered/joined/filesorted
+     * scan on large tables. Fast-plan mode must strip global scopes at
+     * planning time so the key scan stays index-friendly; coverage stays
+     * complete because the per-chunk fetch still applies them.
+     *
+     * Exercises both WHERE and ORDER BY scopes together so it fails if either
+     * kind ever leaks back into the planning query.
      */
     public function test_fast_plan_planning_query_does_not_include_model_global_scope_filters(): void
     {
@@ -248,6 +253,13 @@ class DefaultImportSourceTest extends TestCase
 
         Product::addGlobalScope('test_filter_by_price', function (Builder $builder) {
             $builder->where('price', '>=', 0);
+        });
+        // Mirrors the exact real-world pattern the caller reported:
+        //   static::addGlobalScope('sortCreatedAt', fn ($b) => $b->orderBy('created_at', 'desc'));
+        // 'created_at' is the timestamps column Eloquent adds to Product by
+        // default, so this ORDER BY is executable against the schema.
+        Product::addGlobalScope('test_order_by_created_at', function (Builder $builder) {
+            $builder->orderBy('created_at', 'desc');
         });
 
         try {
@@ -259,15 +271,17 @@ class DefaultImportSourceTest extends TestCase
             DB::connection()->disableQueryLog();
 
             // Chunk-planning select is the one that pluck($key)s from the model
-            // table; the global scope's WHERE must be absent from every one.
+            // table; the global scope's WHERE and ORDER BY must both be absent
+            // from every planning query.
             $planningSelects = $planningQueries->filter(fn ($q) => stripos($q, 'select') === 0);
             $this->assertNotEmpty($planningSelects, 'Expected at least one planning select in the query log');
             foreach ($planningSelects as $q) {
-                $this->assertStringNotContainsString('price', $q, "Planning query leaked global scope filter: $q");
+                $this->assertStringNotContainsString('price', $q, "Planning query leaked global scope WHERE: $q");
+                $this->assertStringNotContainsString('created_at', $q, "Planning query leaked global scope ORDER BY: $q");
             }
 
             // And coverage is intact: every row is still visited despite
-            // planning without the scope's filter.
+            // planning without the scopes.
             $importedKeys = $chunks
                 ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()->modelKeys())
                 ->sort()
@@ -275,7 +289,112 @@ class DefaultImportSourceTest extends TestCase
             $this->assertEquals(Product::orderBy('id')->pluck('id')->all(), $importedKeys->all());
         } finally {
             $this->removeGlobalScopeFromProduct('test_filter_by_price');
+            $this->removeGlobalScopeFromProduct('test_order_by_created_at');
         }
+    }
+
+    /**
+     * @test
+     */
+    public function arithmetic_planning_issues_a_single_aggregate_pair_regardless_of_row_count(): void
+    {
+        // 10 products with chunk size 3 => 4 chunks. Seek planning would emit
+        // 4 planning selects; arithmetic must emit exactly two aggregates
+        // (MIN, MAX) regardless of how many chunks we end up with.
+        $this->createProducts(10);
+
+        DB::connection()->enableQueryLog();
+        $chunks = (new DefaultImportSource(Product::class))->chunked();
+        $queries = collect(DB::connection()->getQueryLog())->pluck('query');
+        DB::connection()->disableQueryLog();
+
+        $aggregates = $queries->filter(fn ($q) => stripos($q, 'min(') !== false || stripos($q, 'max(') !== false);
+        $this->assertCount(2, $aggregates, 'Arithmetic planning must emit exactly MIN + MAX, got: '.$queries->implode(' | '));
+
+        // No key-walking selects during planning — the only per-chunk selects
+        // should be fetches, which we did not trigger here. Match the seek
+        // signature quote-agnostically: `select <quote>products<quote>.<quote>id<quote>` +
+        // an `order by ... limit N` tail.
+        $planningSelects = $queries->filter(fn ($q) => $this->looksLikeKeyWalkingSelect($q, 'products', 'id'));
+        $this->assertCount(0, $planningSelects, 'Arithmetic planning must not walk the key column');
+
+        // Coverage stays exact.
+        $importedKeys = $chunks
+            ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()->modelKeys())
+            ->sort()
+            ->values();
+        $this->assertEquals(Product::orderBy('id')->pluck('id')->all(), $importedKeys->all());
+    }
+
+    /**
+     * @test
+     */
+    public function arithmetic_planner_falls_back_when_declared_int_key_stores_non_numeric_values(): void
+    {
+        // BookWithCustomKey declares $keyType='int' and $incrementing=true by
+        // inheritance from Model, but its custom_key column actually holds
+        // UUIDs (see BookFactory). This misconfiguration is common in older
+        // codebases. Arithmetic would cast UUIDs to (int) 0 and index zero
+        // rows — the fallback catches it after MIN() reveals a non-numeric
+        // value and re-plans via the seek loop, which works for any
+        // orderable column type.
+        $dispatcher = \App\Book::getEventDispatcher();
+        \App\Book::unsetEventDispatcher();
+        factory(\App\Book::class, 6)->create();
+        \App\Book::setEventDispatcher($dispatcher);
+
+        $source = new DefaultImportSource(\App\BookWithCustomKey::class);
+
+        // Same coverage as seek planning would give — no rows silently lost
+        // to a bogus arithmetic range.
+        $importedKeys = $source->chunked()
+            ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()->modelKeys())
+            ->sort()
+            ->values();
+        $expected = \App\BookWithCustomKey::orderBy('custom_key')->pluck('custom_key')->sort()->values();
+
+        $this->assertEquals($expected->all(), $importedKeys->all());
+        $this->assertCount(6, $importedKeys);
+    }
+
+    /**
+     * @test
+     */
+    public function non_incrementing_int_key_falls_back_to_seek_planning(): void
+    {
+        // NonIncrementingProduct is defined at the bottom of this file; it
+        // shares the products table but declares $incrementing = false,
+        // mirroring how apps model manually-assigned integer IDs (snowflake,
+        // ULID-int, imported ids). Arithmetic over the key range would be
+        // meaningful in theory, but Laravel exposes $incrementing as the
+        // clean opt-out signal — respect it and take the seek path.
+        $this->createProducts(6); // rows share the products table
+
+        DB::connection()->enableQueryLog();
+        (new DefaultImportSource(NonIncrementingProduct::class))->chunked();
+        $queries = collect(DB::connection()->getQueryLog())->pluck('query');
+        DB::connection()->disableQueryLog();
+
+        // Seek path: no aggregates, at least one key-walking select.
+        $aggregates = $queries->filter(fn ($q) => stripos($q, 'min(') !== false || stripos($q, 'max(') !== false);
+        $this->assertCount(0, $aggregates, 'Non-incrementing model must not use arithmetic planning; got: '.$queries->implode(' | '));
+
+        $planningSelects = $queries->filter(fn ($q) => $this->looksLikeKeyWalkingSelect($q, 'products', 'id'));
+        $this->assertGreaterThan(0, $planningSelects->count(), 'Non-incrementing model must fall back to the seek loop. Queries: '.$queries->implode(' | '));
+    }
+
+    /**
+     * True when the query matches the shape of a seek-loop planning select:
+     * `SELECT <table>.<key> FROM ... ORDER BY <table>.<key> ASC LIMIT N`.
+     * Identifier-quote agnostic so the test passes on both MySQL (backticks)
+     * and SQLite / PostgreSQL (double quotes).
+     */
+    private function looksLikeKeyWalkingSelect(string $query, string $table, string $key): bool
+    {
+        $normalized = preg_replace('/[`"\'\[\]]/', '', strtolower($query));
+
+        return str_starts_with($normalized, "select {$table}.{$key} from")
+            && str_contains($normalized, 'limit ');
     }
 
     private function createProducts(int $amount): void
@@ -313,5 +432,23 @@ class UsedScope implements Scope
     public function apply(Builder $builder, Model $model)
     {
         $builder->where('type', 'used');
+    }
+}
+
+/**
+ * Test-only variant of Product that shares its table but declares itself
+ * non-incrementing — the opt-out signal an app uses to say "my int PK is not
+ * densely allocated." Deliberately kept outside tests/laravel/app so
+ * SearchableListFactory does not pick it up as a discoverable searchable.
+ */
+class NonIncrementingProduct extends Product
+{
+    protected $table = 'products';
+
+    public $incrementing = false;
+
+    public function searchableAs()
+    {
+        return 'non_incrementing_products';
     }
 }
