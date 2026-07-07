@@ -157,6 +157,42 @@ final class ParallelImportCommandTest extends IntegrationTestCase
     /**
      * @test
      */
+    public function chunk_option_changes_the_number_of_batched_jobs(): void
+    {
+        Bus::fake();
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 10)->create();
+        });
+
+        $source = app(\Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory::class)::from(Product::class)
+            ->withChunkSize(10);
+        $index = \Matchish\ScoutElasticSearch\ElasticSearch\Index::fromSource($source);
+
+        // 10 rows, chunk size 10 => a single chunk (vs 4 at the config default 3).
+        (new DispatchPullBatch($source, $index, 'redis', 'reindex', null))->handle();
+
+        Bus::assertBatched(function (\Illuminate\Bus\PendingBatch $batch) {
+            return $batch->jobs->count() === 1;
+        });
+    }
+
+    /**
+     * @test
+     */
+    public function invalid_chunk_option_fails_fast(): void
+    {
+        Bus::fake();
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--chunk' => '0']);
+
+        $this->assertEquals(ImportCommand::FAILURE, $exitCode);
+        Bus::assertNothingDispatched();
+    }
+
+    /**
+     * @test
+     */
     public function parallel_dispatches_the_prepare_then_fanout_chain(): void
     {
         $this->useSyncQueue();

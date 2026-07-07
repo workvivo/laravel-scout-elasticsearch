@@ -108,6 +108,26 @@ final class ImportCommandTest extends IntegrationTestCase
     /**
      * @test
      */
+    public function inline_import_reports_a_summary_with_document_count_and_time(): void
+    {
+        $dispatcher = Product::getEventDispatcher();
+        Product::unsetEventDispatcher();
+
+        factory(Product::class, 6)->create();
+
+        Product::setEventDispatcher($dispatcher);
+
+        $output = new BufferedOutput();
+        Artisan::call('scout:import', ['searchable' => [Product::class]], $output);
+
+        $text = $output->fetch();
+        $this->assertStringContainsString('6 documents', $text);
+        $this->assertStringContainsString('documents in', $text); // includes elapsed time
+    }
+
+    /**
+     * @test
+     */
     public function import_with_custom_key_all_pages(): void
     {
         $this->app['config']['scout.key'] = 'title';
@@ -176,25 +196,37 @@ final class ImportCommandTest extends IntegrationTestCase
         $output = new BufferedOutput();
         Artisan::call('scout:import', ['searchable' => [Product::class, Book::class]], $output);
 
-        $output = array_map('trim', explode("\n", $output->fetch()));
+        $lines = array_map('trim', explode("\n", $output->fetch()));
 
-        $productStart = trans('scout::import.start', ['searchable' => Product::class]);
-        $productDone = '[OK] '.trans('scout::import.done', ['searchable' => Product::class]);
-        $bookStart = trans('scout::import.start', ['searchable' => Book::class]);
-        $bookDone = '[OK] '.trans('scout::import.done', ['searchable' => Book::class]);
+        $productStart = array_search(trans('scout::import.start', ['searchable' => Product::class]), $lines);
+        $bookStart = array_search(trans('scout::import.start', ['searchable' => Book::class]), $lines);
 
-        // Assert on the messages rather than hardcoded progress-bar line
-        // offsets so the test stays valid as the import pipeline's stage
-        // count changes.
-        foreach ([$productStart, $productDone, $bookStart, $bookDone] as $line) {
-            $this->assertContains($line, $output);
-        }
+        // Each searchable prints a start line and a summary line (with the
+        // document count + elapsed time). Assert on messages rather than
+        // hardcoded progress-bar offsets so the test survives pipeline changes,
+        // and locate the summary by content since it carries dynamic values.
+        $summaryLine = function (string $searchable) use ($lines) {
+            foreach ($lines as $i => $line) {
+                if (str_contains($line, $searchable) && str_contains($line, 'documents in')) {
+                    return $i;
+                }
+            }
 
-        // Start precedes done for each searchable, and Product (passed first)
-        // is imported before Book.
-        $this->assertLessThan(array_search($productDone, $output), array_search($productStart, $output));
-        $this->assertLessThan(array_search($bookStart, $output), array_search($productDone, $output));
-        $this->assertLessThan(array_search($bookDone, $output), array_search($bookStart, $output));
+            return false;
+        };
+        $productDone = $summaryLine(Product::class);
+        $bookDone = $summaryLine(Book::class);
+
+        $this->assertNotFalse($productStart);
+        $this->assertNotFalse($bookStart);
+        $this->assertNotFalse($productDone, 'Product summary line missing');
+        $this->assertNotFalse($bookDone, 'Book summary line missing');
+
+        // Start precedes summary for each searchable, and Product (passed first)
+        // is imported before Book starts.
+        $this->assertLessThan($productDone, $productStart);
+        $this->assertLessThan($bookStart, $productDone);
+        $this->assertLessThan($bookDone, $bookStart);
     }
 
     /**
@@ -346,5 +378,35 @@ final class ImportCommandTest extends IntegrationTestCase
         // bacause in the Post model we have defined the makeAllSearchableUsing method
         // which returns only the published posts.
         $this->assertEquals(1, $response['hits']['total']['value']);
+    }
+
+    /**
+     * @test
+     */
+    public function fast_plan_still_indexes_only_searchable_records(): void
+    {
+        $dispatcher = Post::getEventDispatcher();
+        Post::unsetEventDispatcher();
+
+        // Mix drafts and published across several chunks. --fast-plan plans over
+        // all posts (drafts included), but the fetch must still index published
+        // only — no drafts leaking in.
+        $published = 0;
+        for ($i = 0; $i < 12; $i++) {
+            $state = $i % 2 === 0 ? 'published' : 'draft';
+            factory(Post::class)->states($state)->create();
+            $published += $state === 'published' ? 1 : 0;
+        }
+
+        Post::setEventDispatcher($dispatcher);
+
+        Artisan::call('scout:import', ['searchable' => [Post::class], '--fast-plan' => true]);
+
+        $response = $this->elasticsearch->search([
+            'index' => (new Post())->searchableAs(),
+            'body' => ['query' => ['match_all' => new stdClass()]],
+        ]);
+
+        $this->assertEquals($published, $response['hits']['total']['value']);
     }
 }

@@ -18,6 +18,7 @@ use Matchish\ScoutElasticSearch\Jobs\QueueableJob;
 use Matchish\ScoutElasticSearch\Jobs\StageJob;
 use Matchish\ScoutElasticSearch\Jobs\Stages\CleanUp;
 use Matchish\ScoutElasticSearch\Jobs\Stages\CreateWriteIndex;
+use Matchish\ScoutElasticSearch\Searchable\DefaultImportSource;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
@@ -41,7 +42,9 @@ final class ImportCommand extends Command
         {--queue= : Queue the import jobs run on (defaults to scout.queue, then the app default queue)}
         {--connection= : Queue connection the import jobs run on (defaults to scout.queue, then the app default queue)}
         {--force : Run --parallel even when the resolved queue connection is synchronous}
-        {--wait : With --parallel, block and show a chunk progress bar until the import finishes}';
+        {--wait : With --parallel, block and show a chunk progress bar until the import finishes}
+        {--chunk= : Rows per chunk for this run (overrides the scout.chunk.searchable config)}
+        {--fast-plan : Plan chunk boundaries from bare keys, skipping the eager-load join/filters (faster on joined models)}';
     /**
      * @inheritdoc
      */
@@ -67,6 +70,12 @@ final class ImportCommand extends Command
 
                 return self::FAILURE;
             }
+        }
+
+        if ($this->option('chunk') !== null && (int) $this->option('chunk') < 1) {
+            $this->error(trans('scout::import.invalid_chunk'));
+
+            return self::FAILURE;
         }
 
         if ($this->option('wait') && ! $this->option('parallel')) {
@@ -130,6 +139,18 @@ final class ImportCommand extends Command
         $sourceFactory = app(ImportSourceFactory::class);
         $source = $sourceFactory::from($searchable);
 
+        // Per-run tuning. Only the built-in source supports it; a custom
+        // ImportSource keeps its own chunking/planning.
+        if ($source instanceof DefaultImportSource) {
+            $chunk = $this->option('chunk');
+            if ($chunk !== null) {
+                $source = $source->withChunkSize((int) $chunk);
+            }
+            if ($this->option('fast-plan')) {
+                $source = $source->withFastPlan();
+            }
+        }
+
         $ttl = (int) config('elasticsearch.import.lock_ttl', self::DEFAULT_LOCK_TTL);
         $owner = (new ImportLock($source->searchableAs(), $ttl))->acquire();
 
@@ -168,16 +189,28 @@ final class ImportCommand extends Command
                 return self::SUCCESS;
             }
 
-            // Sequential path is unchanged: scout.queue decides queued vs
-            // inline, and per-model overrides are honoured. null falls back
-            // to the queue driver's default.
+            // Sequential path: scout.queue decides queued vs inline, and
+            // per-model overrides are honoured. null falls back to the queue
+            // driver's default.
             $connection = $this->option('connection') ?: $source->syncWithSearchUsing();
             $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
+
+            $start = microtime(true);
             $this->dispatchSequential($source, $connection, $queue, $owner, $ttl);
             $handedOff = true;
 
-            $doneKey = config('scout.queue') ? 'scout::import.done.queue' : 'scout::import.done';
-            $this->output->success(trans($doneKey, ['searchable' => $searchable]));
+            // Queued sequential is fire-and-forget (runs on a worker), so it can
+            // only report that the job was dispatched. An inline import finished
+            // in-process, so report the same summary as --parallel --wait.
+            if (config('scout.queue')) {
+                $this->output->success(trans('scout::import.done.queue', ['searchable' => $searchable]));
+            } else {
+                $this->output->success(trans('scout::import.done_summary', [
+                    'searchable' => $searchable,
+                    'indexed' => $this->countIndexedDocuments($source->searchableAs()) ?? '?',
+                    'elapsed' => $this->humanElapsed(microtime(true) - $start),
+                ]));
+            }
 
             return self::SUCCESS;
         } finally {
@@ -198,10 +231,20 @@ final class ImportCommand extends Command
         $appearTimeout = (int) config('elasticsearch.import.wait_timeout', self::DEFAULT_WAIT_TIMEOUT);
 
         // Wait for the worker to run the prepare stages + DispatchPullBatch and
-        // publish the batch id. If nothing shows up, the work is still queued —
-        // report that rather than blocking forever (e.g. no worker running).
+        // publish the batch id. There is an unavoidable gap here: a worker has
+        // to pick up the chain, clean up + create the new index, and scan the
+        // primary keys to plan the chunks before the batch (and its job count)
+        // exists — that key scan is the bulk of the wait on a large table. Show
+        // a "preparing" note so the pause is explained, and if nothing shows up
+        // before the timeout, report the work as still queued rather than
+        // blocking forever (e.g. no worker running).
         $record = null;
+        $announced = false;
         while (($record = Cache::get($key)) === null) {
+            if (! $announced) {
+                $this->comment(trans('scout::import.wait_preparing', ['searchable' => $searchable]));
+                $announced = true;
+            }
             if (microtime(true) - $start > $appearTimeout) {
                 $this->warn(trans('scout::import.wait_no_batch', ['searchable' => $searchable]));
 
@@ -220,7 +263,9 @@ final class ImportCommand extends Command
         $indexName = $record['index'] ?? null;
 
         $batch = Bus::findBatch($batchId);
-        $bar = $this->output->createProgressBar($batch !== null ? $batch->totalJobs : (int) ($record['total'] ?? 0));
+        $bar = (new ProgressBarFactory($this->output))
+            ->create($batch !== null ? $batch->totalJobs : (int) ($record['total'] ?? 0));
+        $bar->setMessage(trans('scout::import.indexing', ['searchable' => $searchable]));
         $bar->start();
 
         while ($batch !== null && ! $batch->finished()) {

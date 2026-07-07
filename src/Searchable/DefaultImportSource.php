@@ -19,17 +19,57 @@ final class DefaultImportSource implements ImportSource
      * @var array
      */
     private $scopes;
+    /**
+     * Per-run chunk size override. Null falls back to the scout.chunk.searchable
+     * config. Carried on the source so it survives serialization to the queue
+     * workers that build the chunks.
+     *
+     * @var int|null
+     */
+    private $chunkSize;
+    /**
+     * When true, chunk boundaries are planned from a bare key query that skips
+     * makeAllSearchableUsing and the injected scopes (the eager-load joins /
+     * filters). The per-chunk fetch still applies them, so this only widens the
+     * planned ranges — coverage stays complete and no extra rows are indexed —
+     * while making each planning query a cheap index-only key scan.
+     *
+     * @var bool
+     */
+    private $fastPlan;
 
     /**
      * DefaultImportSource constructor.
      *
      * @param  string  $className
      * @param  array  $scopes
+     * @param  int|null  $chunkSize
+     * @param  bool  $fastPlan
      */
-    public function __construct(string $className, array $scopes = [])
+    public function __construct(string $className, array $scopes = [], ?int $chunkSize = null, bool $fastPlan = false)
     {
         $this->className = $className;
         $this->scopes = $scopes;
+        $this->chunkSize = $chunkSize;
+        $this->fastPlan = $fastPlan;
+    }
+
+    /**
+     * Return a copy of this source that chunks by the given size instead of the
+     * configured default.
+     */
+    public function withChunkSize(?int $chunkSize): self
+    {
+        return new static($this->className, $this->scopes, $chunkSize, $this->fastPlan);
+    }
+
+    /**
+     * Return a copy of this source that plans chunk boundaries without the
+     * eager-load join / filters (faster planning on joined models).
+     */
+    public function withFastPlan(bool $fastPlan = true): self
+    {
+        return new static($this->className, $this->scopes, $this->chunkSize, $fastPlan);
     }
 
     public function syncWithSearchUsingQueue(): ?string
@@ -51,8 +91,9 @@ final class DefaultImportSource implements ImportSource
     {
         // Guard against a misconfigured chunk size: 0 or a negative value would
         // make limit($chunkSize) return nothing, leaving $bounds empty and
-        // silently importing into an empty index.
-        $chunkSize = max(1, (int) config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE));
+        // silently importing into an empty index. A per-run override (the
+        // command's --chunk option) takes precedence over the config.
+        $chunkSize = max(1, (int) ($this->chunkSize ?? config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE)));
         $key = $this->model()->getQualifiedKeyName();
 
         // Build the chunk boundaries by seeking through the primary keys rather
@@ -70,11 +111,17 @@ final class DefaultImportSource implements ImportSource
         // any competing ORDER BY (e.g. from a model global scope or
         // makeAllSearchableUsing) that would otherwise make the key sequence
         // non-monotonic and cause chunks to skip or duplicate rows.
+        //
+        // In fast-plan mode the boundaries come from a bare key query
+        // (planningQuery) that skips the eager-load join/filters; the per-chunk
+        // fetch still applies them, so ranges only widen and coverage is
+        // unchanged (see planningQuery()).
         $bounds = collect();
         $last = null;
 
         do {
-            $query = $this->newQuery()->reorder()->orderBy($key)->limit($chunkSize);
+            $planningQuery = $this->fastPlan ? $this->planningQuery() : $this->newQuery();
+            $query = $planningQuery->reorder()->orderBy($key)->limit($chunkSize);
 
             if ($last !== null) {
                 $query->where($key, '>', $last);
@@ -101,7 +148,7 @@ final class DefaultImportSource implements ImportSource
             $start = $index === 0 ? null : $bounds->get($index - 1);
             $chunkScope = new ChunkScope($start, $end);
 
-            return new static($this->className, array_merge($this->scopes, [$chunkScope]));
+            return new static($this->className, array_merge($this->scopes, [$chunkScope]), $this->chunkSize, $this->fastPlan);
         });
     }
 
@@ -132,6 +179,30 @@ final class DefaultImportSource implements ImportSource
 
             return $instance;
         }, $query);
+    }
+
+    /**
+     * Bare key query for fast-plan boundary building: the base model query with
+     * only the soft-delete handling that the fetch uses, and none of the
+     * eager-load join / filters from makeAllSearchableUsing or the injected
+     * scopes.
+     *
+     * This is safe because those clauses can only ever *restrict* the fetched
+     * rows (an inner join or where narrows the set) or *decorate* them (eager
+     * load), never add rows outside the table's key space. So planning over the
+     * bare keys always covers every key the fetch could return — ranges may be
+     * wider (a few lighter chunks), but nothing is skipped, and the fetch still
+     * applies the join/filters so no extra records are indexed.
+     */
+    private function planningQuery(): Builder
+    {
+        $query = $this->model()->newQuery();
+
+        $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
+
+        return $query->when($softDelete, function ($query) {
+            return $query->withTrashed();
+        });
     }
 
     public function get(): EloquentCollection

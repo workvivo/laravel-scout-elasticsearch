@@ -2,6 +2,7 @@
 
 namespace Tests\Integration\Searchable;
 
+use App\Post;
 use App\Product;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
@@ -49,6 +50,73 @@ class DefaultImportSourceTest extends TestCase
 
         // Every key is imported once — no gaps, no duplicates across chunks.
         $this->assertEquals($expectedKeys->all(), $importedKeys->all());
+    }
+
+    public function test_with_chunk_size_overrides_the_configured_chunk_size()
+    {
+        $this->createProducts(10);
+
+        // Config default is 3 (=> 4 chunks); the override wins.
+        $withOverride = (new DefaultImportSource(Product::class))->withChunkSize(100);
+        $this->assertCount(1, $withOverride->chunked());
+
+        $smaller = (new DefaultImportSource(Product::class))->withChunkSize(5);
+        $this->assertCount(2, $smaller->chunked());
+
+        // Coverage is still complete with an overridden size.
+        $importedKeys = $smaller->chunked()
+            ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()->modelKeys())
+            ->sort()
+            ->values();
+        $this->assertEquals(Product::orderBy('id')->pluck('id')->all(), $importedKeys->all());
+    }
+
+    public function test_non_positive_chunk_override_falls_back_to_a_safe_size()
+    {
+        $this->createProducts(4);
+
+        // 0 or negative must not silently produce zero chunks (empty index).
+        $this->assertGreaterThan(0, (new DefaultImportSource(Product::class))->withChunkSize(0)->chunked()->count());
+    }
+
+    public function test_fast_plan_indexes_the_same_records_as_join_aware_planning()
+    {
+        $dispatcher = Post::getEventDispatcher();
+        Post::unsetEventDispatcher();
+
+        // Post::makeAllSearchableUsing filters to published — a filtering clause
+        // behaves exactly like a filtering inner join for planning purposes.
+        // Interleave published/draft so the two strategies produce genuinely
+        // different chunk boundaries: join-aware planning chunks over published
+        // rows only, fast planning chunks over every row.
+        for ($i = 0; $i < 12; $i++) {
+            factory(Post::class)->states($i % 2 === 0 ? 'published' : 'draft')->create();
+        }
+
+        Post::setEventDispatcher($dispatcher);
+
+        $indexedKeys = function (DefaultImportSource $source) {
+            return $source->chunked()
+                ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()
+                    ->filter(fn ($model) => $model->shouldBeSearchable())
+                    ->modelKeys())
+                ->sort()
+                ->values()
+                ->all();
+        };
+
+        $joinAware = new DefaultImportSource(Post::class);
+        $fast = (new DefaultImportSource(Post::class))->withFastPlan();
+
+        // The two strategies produce different chunk boundaries (chunk size 3:
+        // 6 published => 2 chunks vs 12 total => 4 chunks)...
+        $this->assertNotEquals($joinAware->chunked()->count(), $fast->chunked()->count());
+
+        // ...yet index exactly the same records — and exactly the published set,
+        // never a draft.
+        $published = Post::where('status', 'published')->orderBy('id')->pluck('id')->all();
+        $this->assertEquals($published, $indexedKeys($joinAware));
+        $this->assertEquals($published, $indexedKeys($fast));
     }
 
     public function test_chunked_seeks_by_key_range_instead_of_offset()

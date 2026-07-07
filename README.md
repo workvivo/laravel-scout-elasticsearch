@@ -187,6 +187,11 @@ While working in production, to keep your existing search experience available w
 
 The command create new temporary index, import all models to it, and then switch to the index and remove old index.
 
+When it runs inline (no `scout.queue`), it finishes with a summary of how many
+documents were indexed and how long it took, e.g.
+`[App\Product] imported: 48213 documents in 4m 12s.` When `scout.queue` is set the
+job is queued and the command just reports that it was dispatched.
+
 #### Parallel import
 
 Imports run chunk by chunk in a single job by default. On large tables you can fan the
@@ -236,6 +241,30 @@ php artisan scout:import "App\Models\Product" --parallel --wait
 `--wait` polls the batch, so it needs workers running to make progress. If no
 worker picks the batch up within `elasticsearch.import.wait_timeout` (default
 120s / `SCOUT_IMPORT_WAIT_TIMEOUT`) it reports the work as still queued and exits.
+
+##### Tuning chunk size and planning
+
+`--chunk=N` overrides `scout.chunk.searchable` for a single run. Fewer, larger
+chunks mean fewer planning queries and fewer jobs to enqueue (faster start-up),
+at the cost of coarser parallelism and more rows held per job:
+
+```
+php artisan scout:import "App\Models\Comment" --parallel --wait --chunk=5000
+```
+
+Chunk boundaries are planned by seeking the primary keys through the same query
+`makeAllSearchableUsing` builds — including any eager-load join. On a joined
+model that join runs on every planning query. `--fast-plan` plans the boundaries
+from a bare key query instead (skipping the join/filters), which is much cheaper:
+
+```
+php artisan scout:import "App\Models\Comment" --parallel --wait --fast-plan
+```
+
+This is safe: the per-chunk fetch still applies the full join/filters and
+`shouldBeSearchable()`, so the planned ranges only widen — every searchable
+record is still covered exactly once and no extra records are indexed. The only
+effect is that some chunks may fetch fewer rows than their key-span suggests.
 
 #### Concurrent imports
 
