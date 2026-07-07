@@ -29,8 +29,9 @@ final class ImportCommand extends Command
      */
     protected $signature = 'scout:import {searchable?* : The name of the searchable}
         {--parallel : Import chunks in parallel across queue workers}
-        {--queue= : Queue the import jobs run on (defaults to the scout.queue config)}
-        {--connection= : Queue connection the import jobs run on (defaults to the scout.queue config)}';
+        {--queue= : Queue the import jobs run on (defaults to scout.queue, then the app default queue)}
+        {--connection= : Queue connection the import jobs run on (defaults to scout.queue, then the app default queue)}
+        {--force : Run --parallel even when the resolved queue connection is synchronous}';
     /**
      * @inheritdoc
      */
@@ -41,10 +42,21 @@ final class ImportCommand extends Command
      */
     public function handle(): int
     {
-        if ($this->option('parallel') && ! config('scout.queue')) {
-            $this->error(trans('scout::import.parallel_requires_queue'));
+        // --parallel fans chunks out onto a queue, so it only does real work on
+        // an asynchronous connection. It does NOT require scout.queue (that flag
+        // only governs per-model index syncs): the connection is resolved from
+        // --connection, then scout.queue, then the app's default queue. Bail
+        // early if that resolves to the sync driver, unless --force is given.
+        if ($this->option('parallel') && ! $this->option('force')) {
+            $connection = $this->resolvedConnection();
 
-            return self::FAILURE;
+            if ($this->isSyncConnection($connection)) {
+                $this->error(trans('scout::import.parallel_requires_async_queue', [
+                    'connection' => $connection ?? 'sync',
+                ]));
+
+                return self::FAILURE;
+            }
         }
 
         $this->searchableList((array) $this->argument('searchable'))
@@ -53,6 +65,37 @@ final class ImportCommand extends Command
         });
 
         return self::SUCCESS;
+    }
+
+    /**
+     * The queue connection --parallel work is dispatched on: the explicit
+     * --connection option, else the scout.queue connection when configured,
+     * else the application's default queue connection.
+     */
+    private function resolvedConnection(): ?string
+    {
+        return $this->option('connection')
+            ?: config('scout.queue.connection')
+            ?: config('queue.default');
+    }
+
+    /**
+     * The queue name --parallel work is dispatched on: the explicit --queue
+     * option, else the scout.queue queue when configured (null = the
+     * connection's default queue).
+     */
+    private function resolvedQueue(): ?string
+    {
+        return $this->option('queue') ?: config('scout.queue.queue');
+    }
+
+    private function isSyncConnection(?string $connection): bool
+    {
+        if ($connection === null) {
+            return true;
+        }
+
+        return config("queue.connections.{$connection}.driver") === 'sync';
     }
 
     private function searchableList(array $argument): Collection
@@ -90,15 +133,17 @@ final class ImportCommand extends Command
             $startMessage = trans('scout::import.start', ['searchable' => "<comment>$searchable</comment>"]);
             $this->line($startMessage);
 
-            // null on either falls back to the queue driver's default, matching
-            // the original dispatch behaviour.
-            $connection = $this->option('connection') ?: $source->syncWithSearchUsing();
-            $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
-
             if ($this->option('parallel')) {
-                $this->dispatchParallel($source, $connection, $queue, $owner, $ttl);
+                // Resolve independently of scout.queue so parallel imports can
+                // use the app's default (e.g. SQS) queue on their own.
+                $this->dispatchParallel($source, $this->resolvedConnection(), $this->resolvedQueue(), $owner, $ttl);
                 $doneKey = 'scout::import.done.queue';
             } else {
+                // Sequential path is unchanged: scout.queue decides queued vs
+                // inline, and per-model overrides are honoured. null falls back
+                // to the queue driver's default.
+                $connection = $this->option('connection') ?: $source->syncWithSearchUsing();
+                $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
                 $this->dispatchSequential($source, $connection, $queue, $owner, $ttl);
                 $doneKey = config('scout.queue') ? 'scout::import.done.queue' : 'scout::import.done';
             }

@@ -61,6 +61,7 @@ final class ImportLockTest extends IntegrationTestCase
         $options = ['searchable' => [Product::class]];
         if ($parallel) {
             $options['--parallel'] = true;
+            $options['--force'] = true; // sync connection in tests
         }
 
         $exitCode = Artisan::call('scout:import', $options);
@@ -122,7 +123,7 @@ final class ImportLockTest extends IntegrationTestCase
             factory(Product::class, 5)->create();
         });
 
-        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
 
         $owner = (new ImportLock((new Product())->searchableAs(), 3600))->acquire();
         $this->assertNotNull($owner, 'Import lock should be released after the parallel batch finishes');

@@ -15,9 +15,29 @@ use Tests\IntegrationTestCase;
 
 final class ParallelImportCommandTest extends IntegrationTestCase
 {
+    /**
+     * Route Scout imports through the sync connection. Sync executes batched
+     * jobs inline, so parallel imports run end-to-end in the test process — but
+     * because it is the sync driver, --parallel needs --force to proceed.
+     */
     private function useSyncQueue(): void
     {
         $this->app['config']->set('scout.queue', ['connection' => 'sync', 'queue' => 'scout']);
+    }
+
+    /**
+     * scout.queue disabled, but the app's default queue is an asynchronous
+     * connection — the real-world setup where --parallel should just work.
+     */
+    private function useAsyncDefaultQueue(): void
+    {
+        $this->app['config']->set('scout.queue', false);
+        $this->app['config']->set('queue.connections.async_test', [
+            'driver' => 'database',
+            'table' => 'jobs',
+            'queue' => 'default',
+        ]);
+        $this->app['config']->set('queue.default', 'async_test');
     }
 
     private function withoutModelEvents(string $class, callable $callback): void
@@ -52,7 +72,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
             factory(Product::class, $productsAmount)->create();
         });
 
-        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
 
         $this->assertEquals($productsAmount, $this->searchTotal((new Product())->searchableAs()));
     }
@@ -70,7 +90,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         });
 
         // No searchable argument: the command discovers and imports every model.
-        Artisan::call('scout:import', ['--parallel' => true]);
+        Artisan::call('scout:import', ['--parallel' => true, '--force' => true]);
 
         $this->assertEquals($productsAmount, $this->searchTotal((new Product())->searchableAs()));
     }
@@ -78,16 +98,59 @@ final class ParallelImportCommandTest extends IntegrationTestCase
     /**
      * @test
      */
-    public function parallel_requires_a_queue_and_dispatches_nothing_without_one(): void
+    public function parallel_errors_when_the_resolved_connection_is_sync(): void
     {
         Bus::fake();
 
-        // scout.queue is false by default (see TestCase).
+        // scout.queue disabled and the default queue is the sync driver: there
+        // is no real parallelism to be had, so it fails fast rather than
+        // silently running serially.
+        $this->app['config']->set('scout.queue', false);
+        $this->app['config']->set('queue.default', 'sync');
+
         $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
 
-        $this->assertEquals(ImportCommand::FAILURE ?? 1, $exitCode);
+        $this->assertEquals(ImportCommand::FAILURE, $exitCode);
         Bus::assertNothingDispatched();
         Bus::assertNothingBatched();
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_works_without_scout_queue_on_an_async_default_connection(): void
+    {
+        $this->useAsyncDefaultQueue();
+        Bus::fake();
+
+        // No --force, no scout.queue: it should dispatch onto the app default.
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        Bus::assertChained([
+            StageJob::class,
+            StageJob::class,
+            DispatchPullBatch::class,
+        ]);
+    }
+
+    /**
+     * @test
+     */
+    public function force_runs_parallel_inline_on_a_sync_connection(): void
+    {
+        // scout.queue disabled and sync default — --force runs it inline anyway.
+        $this->app['config']->set('scout.queue', false);
+        $this->app['config']->set('queue.default', 'sync');
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 5)->create();
+        });
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertEquals(5, $this->searchTotal((new Product())->searchableAs()));
     }
 
     /**
@@ -98,7 +161,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         $this->useSyncQueue();
         Bus::fake();
 
-        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
 
         Bus::assertChained([
             StageJob::class,
@@ -127,7 +190,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
             factory(Product::class, 5)->create();
         });
 
-        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
 
         $this->assertFalse(
             $this->elasticsearch->indices()->exists(['index' => 'products_old']),

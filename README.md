@@ -202,13 +202,27 @@ swapped to the new index once every chunk succeeds; if any chunk fails, the old
 index keeps serving, the failure is reported, and the half-filled new index is
 removed so it does not linger on the cluster.
 
-`--parallel` requires a configured queue (`scout.queue`). By default the batch runs
-on the connection/queue from that config; override per run with `--connection` and
-`--queue` (handy for routing a big reindex onto a dedicated queue):
+`--parallel` does **not** require `scout.queue` (that flag only governs per-model
+index syncs). It resolves its queue connection from `--connection`, then the
+`scout.queue` connection if set, then your app's **default queue**
+(`config('queue.default')`) — so it uses your existing queues (e.g. SQS, Redis)
+out of the box. Override per run with `--connection` and `--queue`, handy for
+routing a big reindex onto a dedicated queue:
 
 ```
 php artisan scout:import "App\Models\Product" --parallel --connection=redis --queue=reindex
 ```
+
+If the resolved connection is the `sync` driver there is no real parallelism, so
+the command stops with an error. Pass `--force` to run it inline on `sync` anyway:
+
+```
+php artisan scout:import "App\Models\Product" --parallel --force
+```
+
+`Bus::batch` needs the `job_batches` table (`php artisan queue:batches-table`
+then migrate) and the `queue.batching` config — the same requirement as any
+Laravel batch.
 
 #### Concurrent imports
 
