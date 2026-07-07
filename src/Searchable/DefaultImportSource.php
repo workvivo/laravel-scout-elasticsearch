@@ -184,19 +184,26 @@ final class DefaultImportSource implements ImportSource
     /**
      * Bare key query for fast-plan boundary building: the base model query with
      * only the soft-delete handling that the fetch uses, and none of the
-     * eager-load join / filters from makeAllSearchableUsing or the injected
-     * scopes.
+     * eager-load join / filters from makeAllSearchableUsing, the injected
+     * scopes, or the model's own registered global scopes.
+     *
+     * Stripping model global scopes matters on large tables where a WHERE
+     * added by a scope (tenant filter, published-only, custom SoftDeletes,
+     * etc.) turns the planning key scan into a full table/join scan.
+     * withoutGlobalScopes() removes them — including SoftDeletingScope — so
+     * the soft-delete branch below is redundant when they are stripped but is
+     * kept for consistency with newQuery(); withTrashed() is idempotent.
      *
      * This is safe because those clauses can only ever *restrict* the fetched
      * rows (an inner join or where narrows the set) or *decorate* them (eager
      * load), never add rows outside the table's key space. So planning over the
      * bare keys always covers every key the fetch could return — ranges may be
      * wider (a few lighter chunks), but nothing is skipped, and the fetch still
-     * applies the join/filters so no extra records are indexed.
+     * applies the join/filters/scopes so no extra records are indexed.
      */
     private function planningQuery(): Builder
     {
-        $query = $this->model()->newQuery();
+        $query = $this->model()->newQuery()->withoutGlobalScopes();
 
         $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
 

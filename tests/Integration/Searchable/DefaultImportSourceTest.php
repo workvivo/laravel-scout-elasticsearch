@@ -235,6 +235,49 @@ class DefaultImportSourceTest extends TestCase
         }
     }
 
+    /**
+     * Regression test: a model global scope that adds a WHERE clause turns the
+     * planning key scan into a filtered/joined scan on large tables. Fast-plan
+     * mode must strip global scopes at planning time so the key scan stays
+     * index-friendly; coverage stays complete because the per-chunk fetch
+     * still applies them.
+     */
+    public function test_fast_plan_planning_query_does_not_include_model_global_scope_filters(): void
+    {
+        $this->createProducts(6);
+
+        Product::addGlobalScope('test_filter_by_price', function (Builder $builder) {
+            $builder->where('price', '>=', 0);
+        });
+
+        try {
+            $source = (new DefaultImportSource(Product::class))->withFastPlan();
+
+            DB::connection()->enableQueryLog();
+            $chunks = $source->chunked();
+            $planningQueries = collect(DB::connection()->getQueryLog())->pluck('query');
+            DB::connection()->disableQueryLog();
+
+            // Chunk-planning select is the one that pluck($key)s from the model
+            // table; the global scope's WHERE must be absent from every one.
+            $planningSelects = $planningQueries->filter(fn ($q) => stripos($q, 'select') === 0);
+            $this->assertNotEmpty($planningSelects, 'Expected at least one planning select in the query log');
+            foreach ($planningSelects as $q) {
+                $this->assertStringNotContainsString('price', $q, "Planning query leaked global scope filter: $q");
+            }
+
+            // And coverage is intact: every row is still visited despite
+            // planning without the scope's filter.
+            $importedKeys = $chunks
+                ->flatMap(fn (DefaultImportSource $chunk) => $chunk->get()->modelKeys())
+                ->sort()
+                ->values();
+            $this->assertEquals(Product::orderBy('id')->pluck('id')->all(), $importedKeys->all());
+        } finally {
+            $this->removeGlobalScopeFromProduct('test_filter_by_price');
+        }
+    }
+
     private function createProducts(int $amount): void
     {
         $dispatcher = Product::getEventDispatcher();
