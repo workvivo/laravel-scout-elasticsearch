@@ -158,7 +158,11 @@ final class ImportCommand extends Command
         // rather than racing its alias swap. Different models are unaffected —
         // each holds its own key. A skip is not a failure.
         if ($owner === null) {
-            $this->warn(trans('scout::import.already_running', ['searchable' => $searchable]));
+            $this->warn(trans('scout::import.already_running', [
+                'searchable' => $searchable,
+                'key' => ImportLock::keyFor($source->searchableAs()),
+                'ttl' => $ttl,
+            ]));
 
             return self::SUCCESS;
         }

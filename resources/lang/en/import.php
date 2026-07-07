@@ -5,7 +5,7 @@ return [
     'done' => 'All [:searchable] records have been imported.',
     'done_summary' => '[:searchable] imported: :indexed documents in :elapsed.',
     'done.queue' => 'Import job dispatched to the queue.',
-    'already_running' => 'An import for [:searchable] is already running. Skipping.',
+    'already_running' => 'An import for [:searchable] is already running (lock key: :key, inactivity TTL :ttl s). Skipping. If you are sure no run is in flight, clear it with `php artisan tinker` -> `Cache::forget(\':key\')`.',
     'parallel_requires_async_queue' => 'The --parallel option needs an asynchronous queue, but connection [:connection] uses the sync driver. Pass --connection, set your default queue, or use --force to run inline.',
     'invalid_chunk' => 'The --chunk option must be a positive integer.',
     'wait_needs_parallel' => 'The --wait option only applies to --parallel imports and was ignored.',

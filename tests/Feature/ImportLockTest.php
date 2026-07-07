@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Bus;
 use Matchish\ScoutElasticSearch\ImportLock;
 use stdClass;
+use Symfony\Component\Console\Output\BufferedOutput;
 use Tests\IntegrationTestCase;
 
 /**
@@ -70,6 +71,25 @@ final class ImportLockTest extends IntegrationTestCase
         $this->assertEquals(0, $exitCode);
         Bus::assertNothingDispatched();
         Bus::assertNothingBatched();
+    }
+
+    /**
+     * @test
+     */
+    public function skip_message_names_the_cache_key_so_operators_can_clear_it(): void
+    {
+        // The lock's underlying cache key is not obvious from the model name
+        // (custom searchableAs, plurals), so the skip message spells it out
+        // verbatim to make a stuck lock trivially recoverable via tinker.
+        $searchableAs = (new Product())->searchableAs();
+        (new ImportLock($searchableAs, 3600))->acquire();
+
+        $output = new BufferedOutput();
+        Artisan::call('scout:import', ['searchable' => [Product::class]], $output);
+
+        $text = $output->fetch();
+        $this->assertStringContainsString(ImportLock::keyFor($searchableAs), $text);
+        $this->assertStringContainsString('Cache::forget', $text);
     }
 
     /**
