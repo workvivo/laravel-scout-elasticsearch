@@ -1,14 +1,13 @@
 #!/usr/bin/make
-# Makefile readme (ru): <http://linux.yaroslavl.ru/docs/prog/gnu_make_3-79_russian_manual.html>
 # Makefile readme (en): <https://www.gnu.org/software/make/manual/html_node/index.html#SEC_Contents>
 
 SHELL = /bin/sh
 APP_CONTAINER_NAME := app
 
 docker_bin := $(shell command -v docker 2> /dev/null)
-docker_compose_bin := $(shell command -v docker-compose 2> /dev/null)
+docker_compose_bin := $(docker_bin) compose
 
-.PHONY : help test \
+.PHONY : help test analyse \
          up down restart shell install
 .DEFAULT_GOAL := help
 
@@ -21,9 +20,6 @@ help: ## Show this help
 ---------------: ## ---------------
 
 up: ## Start all containers (in background) for development
-    ifeq ($(OS), Windows_NT)
-	    sudo sysctl -w vm.max_map_count=262144
-    endif
 	$(docker_compose_bin) up -d
 
 down: ## Stop all started for development containers
@@ -39,18 +35,19 @@ install: up ## Install application dependencies into application container
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" composer install --no-interaction --ansi
 
 test: up ## Execute application tests
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --testdox --stop-on-failure'
+
+analyse: up ## Execute static analysis
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpstan analyze --memory-limit=4000M
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit --testdox --stop-on-failure
 
 test-coverage: up ## Execute application tests and generate report
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpstan analyze
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit  --coverage-html build/coverage-report
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=coverage ./vendor/bin/phpunit --coverage-html build/coverage-report'
 
 test-filter:
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit --filter=$(filter) --testdox
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --filter=$(filter) --testdox'
 
 test-unit:
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure'
 
 test-local: ## Run tests locally without docker (requires native mysql + opensearch)
 	XDEBUG_MODE=off ./vendor/bin/phpunit --testdox
