@@ -26,13 +26,14 @@ ENV COMPOSER_HOME /tmp
 
 # Set timezone
 RUN ln -snf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime && echo ${TIMEZONE} > /etc/timezone
-RUN printf '[PHP]\ndate.timezone = "%s"\n', ${TIMEZONE} > /usr/local/etc/php/conf.d/tzone.ini
-RUN "date"
+RUN printf '[PHP]\ndate.timezone = "%s"\n' "${TIMEZONE}" > /usr/local/etc/php/conf.d/tzone.ini
+RUN date
 
-FROM php AS php-development
-# install xdebug
+FROM php AS php-xdebug
 RUN pecl install xdebug
 RUN docker-php-ext-enable xdebug
+
+FROM php-xdebug AS php-development
 RUN echo "error_reporting = E_ALL" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "display_startup_errors = On" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "display_errors = On" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
@@ -43,4 +44,4 @@ RUN echo "xdebug.client_port=9005" >> /usr/local/etc/php/conf.d/docker-php-ext-x
 RUN echo "xdebug.mode=debug" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "xdebug.start_with_request=yes" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 
-FROM php AS php-testing
+FROM php-xdebug AS php-testing

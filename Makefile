@@ -7,7 +7,7 @@ APP_CONTAINER_NAME := app
 docker_bin := $(shell command -v docker 2> /dev/null)
 docker_compose_bin := $(docker_bin) compose
 
-.PHONY : help test analyse \
+.PHONY : help test analyse check-opensearch-host \
          up down restart shell install
 .DEFAULT_GOAL := help
 
@@ -19,8 +19,18 @@ help: ## Show this help
 
 ---------------: ## ---------------
 
-up: ## Start all containers (in background) for development
+up: check-opensearch-host ## Start all containers (in background) for development
 	$(docker_compose_bin) up -d
+
+check-opensearch-host:
+	@if [ "$$(uname -s)" = "Linux" ] && [ -r /proc/sys/vm/max_map_count ]; then \
+		current=$$(cat /proc/sys/vm/max_map_count); \
+		if [ "$$current" -lt 262144 ]; then \
+			echo "vm.max_map_count must be at least 262144 for OpenSearch."; \
+			echo "Run: sudo sysctl -w vm.max_map_count=262144"; \
+			exit 1; \
+		fi; \
+	fi
 
 down: ## Stop all started for development containers
 	$(docker_compose_bin) down
