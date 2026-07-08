@@ -320,17 +320,28 @@ To keep a big reindex healthy:
   ```php
   // config/elasticsearch.php → 'import'
   'batch' => [
-      'tries' => 25,          // SCOUT_IMPORT_BATCH_TRIES (1 = no retry)
-      'backoff_base' => 5,    // seconds
-      'backoff_cap' => 120,
+      'tries' => 3,           // SCOUT_IMPORT_BATCH_TRIES (1 = no retry)
+      'backoff_base' => 5,    // SCOUT_IMPORT_BATCH_BACKOFF_BASE, seconds
+      'backoff_cap' => 120,   // SCOUT_IMPORT_BATCH_BACKOFF_CAP, seconds
+      'retry_until' => 0,     // SCOUT_IMPORT_BATCH_RETRY_UNTIL (0 = tries only)
   ],
   ```
+
+  `SCOUT_IMPORT_BATCH_TRIES=3` means each chunk can run three times total: the
+  first attempt plus two retries. Keep this bounded; it is for transient database
+  contention around Laravel's batch bookkeeping, not for retrying bad mappings or
+  permanently failing data.
 
 - Raising MySQL's `innodb_lock_wait_timeout` is a stopgap only — it lets a waiter
   block longer before erroring, but it masks contention rather than removing it.
 
 A failed parallel import never swaps the alias and removes its half-built index,
 so re-running is safe — the live index keeps serving until a run fully succeeds.
+Once a batch is cancelled, remaining chunk jobs skip work before writing, and the
+rollback waits until the batch has settled before deleting the unpromoted index.
+The destructive cleanup, rollback, and final alias swap all re-check the
+per-model lock owner first, so a stale run whose lease expired cannot delete or
+promote over a newer run's in-progress index.
 
 #### Concurrent imports
 

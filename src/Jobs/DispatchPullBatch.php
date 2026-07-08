@@ -180,7 +180,7 @@ final class DispatchPullBatch implements ShouldQueue
         // Empty table: no chunks to fan out. Mirror the sequential pipeline,
         // which still promotes an empty index, then free the lock.
         if (empty($chunkJobs)) {
-            self::finalize($source, $index);
+            self::finalize($source, $index, $owner);
             if ($progressKey !== null) {
                 Cache::put($progressKey, ['empty' => true, 'index' => $index->name()], $ttl);
             }
@@ -211,8 +211,11 @@ final class DispatchPullBatch implements ShouldQueue
                 }
             })
             // Runs only when every chunk succeeded — refresh and swap the alias.
-            ->then(function (Batch $batch) use ($source, $index) {
-                self::finalize($source, $index);
+            // finalize() re-checks lock ownership before the swap, so a stale run
+            // whose lease lapsed here (and was re-acquired by a newer import)
+            // aborts instead of deleting the newer run's in-progress index.
+            ->then(function (Batch $batch) use ($source, $index, $owner) {
+                self::finalize($source, $index, $owner);
             })
             // A failed chunk cancels the batch: we never swap, so the old index
             // keeps serving. Just report the triggering failure here — the
@@ -263,12 +266,12 @@ final class DispatchPullBatch implements ShouldQueue
         }
     }
 
-    private static function finalize(ImportSource $source, Index $index): void
+    private static function finalize(ImportSource $source, Index $index, ?string $owner = null): void
     {
         $elasticsearch = app(Client::class);
         try {
             (new RefreshIndex($index))->handle($elasticsearch);
-            (new SwitchToNewAndRemoveOldIndex($source, $index))->handle($elasticsearch);
+            (new SwitchToNewAndRemoveOldIndex($source, $index, $owner))->handle($elasticsearch);
         } catch (Missing404Exception $e) {
             // The concrete index vanished before we could promote it — a
             // superseding run of the same model deleted it out from under us.

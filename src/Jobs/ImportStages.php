@@ -28,7 +28,7 @@ class ImportStages extends Collection
             new CreateWriteIndex($source, $index),
             PullFromSource::chunked($source, $profile),
             new RefreshIndex($index),
-            new SwitchToNewAndRemoveOldIndex($source, $index),
+            new SwitchToNewAndRemoveOldIndex($source, $index, $owner),
         ]))->flatten()->filter();
     }
 }
