@@ -8,8 +8,10 @@ use App\Product;
 use Illuminate\Bus\PendingBatch;
 use Illuminate\Support\Facades\Bus;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
+use Matchish\ScoutElasticSearch\ImportLock;
 use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
 use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
+use ReflectionMethod;
 use stdClass;
 use Tests\IntegrationTestCase;
 
@@ -137,6 +139,130 @@ final class DispatchPullBatchTest extends IntegrationTestCase
 
         $this->assertTrue($this->elasticsearch->indices()->exists(['index' => 'products_one']));
         $this->assertTrue($this->elasticsearch->indices()->exists(['index' => 'orders_two']));
+    }
+
+    /**
+     * @test
+     */
+    public function remove_unpromoted_index_deletes_when_still_the_lock_owner(): void
+    {
+        $source = $this->source();
+        $index = Index::fromSource($source);
+        $this->elasticsearch->indices()->create(['index' => $index->name()]);
+
+        $owner = (new ImportLock($source->searchableAs(), 3600))->acquire();
+
+        DispatchPullBatch::removeUnpromotedIndex($source, $index, $owner);
+
+        $this->assertFalse(
+            $this->elasticsearch->indices()->exists(['index' => $index->name()]),
+            'The still-owned run must roll back its own half-filled index'
+        );
+    }
+
+    /**
+     * @test
+     */
+    public function remove_unpromoted_index_skips_when_the_lease_belongs_to_another_run(): void
+    {
+        $source = $this->source();
+        $index = Index::fromSource($source);
+        $this->elasticsearch->indices()->create(['index' => $index->name()]);
+
+        // Someone else now owns the lease for this model.
+        (new ImportLock($source->searchableAs(), 3600))->acquire();
+
+        DispatchPullBatch::removeUnpromotedIndex($source, $index, 'stale-owner-token');
+
+        $this->assertTrue(
+            $this->elasticsearch->indices()->exists(['index' => $index->name()]),
+            'Must not delete an index once our lease has been taken over by another run'
+        );
+    }
+
+    /**
+     * @test
+     */
+    public function finalize_tolerates_a_vanished_index(): void
+    {
+        $source = $this->source();
+        $index = Index::fromSource($source); // deliberately never created in ES
+
+        $finalize = new ReflectionMethod(DispatchPullBatch::class, 'finalize');
+        $finalize->setAccessible(true);
+
+        // A superseding run deleted the index before we could promote it: the
+        // refresh/swap must not throw a raw Missing404Exception.
+        $finalize->invoke(null, $source, $index);
+
+        $this->assertFalse($this->elasticsearch->indices()->exists(['index' => $index->name()]));
+    }
+
+    /**
+     * @test
+     */
+    public function per_model_chunk_config_controls_the_number_of_chunks(): void
+    {
+        Bus::fake();
+        $this->app['config']->set('elasticsearch.import.chunk.products', 5);
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 10)->create();
+        });
+
+        $source = $this->source();
+        $index = Index::fromSource($source);
+        (new DispatchPullBatch($source, $index, null, null, 'owner-token', 900))->handle();
+
+        // 10 rows / per-model chunk 5 => 2 chunks (the test config default is 3).
+        Bus::assertBatched(function (PendingBatch $batch) {
+            return $batch->jobs->count() === 2;
+        });
+    }
+
+    /**
+     * @test
+     */
+    public function chunk_jobs_default_to_a_single_try_with_no_backoff(): void
+    {
+        Bus::fake();
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 6)->create();
+        });
+
+        $source = $this->source();
+        (new DispatchPullBatch($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
+
+        Bus::assertBatched(function (PendingBatch $batch) {
+            return $batch->jobs->every(function ($job) {
+                return $job->tries === 1 && $job->backoff() === [];
+            });
+        });
+    }
+
+    /**
+     * @test
+     */
+    public function chunk_jobs_carry_the_configured_retry_settings(): void
+    {
+        Bus::fake();
+        $this->app['config']->set('elasticsearch.import.batch.tries', 7);
+        $this->app['config']->set('elasticsearch.import.batch.backoff_base', 3);
+        $this->app['config']->set('elasticsearch.import.batch.backoff_cap', 30);
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 6)->create();
+        });
+
+        $source = $this->source();
+        (new DispatchPullBatch($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
+
+        Bus::assertBatched(function (PendingBatch $batch) {
+            return $batch->jobs->every(function ($job) {
+                return $job->tries === 7 && $job->backoffBase === 3 && $job->backoffCap === 30;
+            });
+        });
     }
 
     public function dangerousNames(): array

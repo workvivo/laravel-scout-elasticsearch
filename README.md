@@ -275,6 +275,63 @@ This is safe: the per-chunk fetch still applies the full join/filters and
 record is still covered exactly once and no extra records are indexed. The only
 effect is that some chunks may fetch fewer rows than their key-span suggests.
 
+##### Running large parallel imports safely
+
+`--parallel` fans every chunk of a model into one `Bus::batch`. Laravel records
+each chunk's completion by locking that batch's row in `job_batches`
+(`SELECT … FOR UPDATE`), so the **more chunks finish at once, the more they
+contend on that single row** — and running many large imports together multiplies
+the load on that one table. Under enough contention MySQL raises
+`1205 Lock wait timeout`, which fails a chunk and cancels the whole model's batch.
+To keep a big reindex healthy:
+
+- **Fewer, larger chunks.** Each chunk that finishes is one `job_batches` update,
+  so raising the chunk size cuts contention proportionally. Set it per model
+  (keyed by `searchableAs()`) so small models keep the default:
+
+  ```php
+  // config/elasticsearch.php → 'import'
+  'chunk' => [
+      'default' => null,      // null → scout.chunk.searchable (500)
+      'products' => 2000,
+      'orders'   => 5000,
+  ],
+  ```
+
+  Precedence is `--chunk` > per-model > `default` > `scout.chunk.searchable`.
+
+- **Bound the worker pool.** Contention scales with the number of workers
+  finishing chunks of the same batch at once. A handful of workers (≈4–8) on a
+  dedicated queue is plenty; pointing tens of workers at one batch is what tips it
+  over. Stagger models too — run the biggest ones one at a time (loop with
+  `--wait`) rather than launching them all together.
+
+- **Keep `retry_after` > `timeout`.** If a chunk runs longer than the queue
+  connection's `retry_after` (or an SQS visibility timeout), the queue makes a
+  duplicate available while the first is still running and the job trips
+  `MaxAttemptsExceeded`. Set the connection's `retry_after` comfortably above
+  `elasticsearch.queue.timeout` (`SCOUT_QUEUE_TIMEOUT`).
+
+- **Opt-in chunk retries.** By default a chunk that throws fails immediately
+  (`tries=1`). If transient `job_batches` lock-waits are unavoidable at your
+  scale, let chunks retry with jittered exponential backoff instead of cancelling
+  the batch — the re-index is idempotent, so a retried chunk just overwrites:
+
+  ```php
+  // config/elasticsearch.php → 'import'
+  'batch' => [
+      'tries' => 25,          // SCOUT_IMPORT_BATCH_TRIES (1 = no retry)
+      'backoff_base' => 5,    // seconds
+      'backoff_cap' => 120,
+  ],
+  ```
+
+- Raising MySQL's `innodb_lock_wait_timeout` is a stopgap only — it lets a waiter
+  block longer before erroring, but it masks contention rather than removing it.
+
+A failed parallel import never swaps the alias and removes its half-built index,
+so re-running is safe — the live index keeps serving until a run fully succeeds.
+
 #### Concurrent imports
 
 Chunk boundaries are frozen into each job at dispatch time (keyset seek, not offset),

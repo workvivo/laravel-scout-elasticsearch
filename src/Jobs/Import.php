@@ -70,6 +70,12 @@ final class Import
     public function handle(Client $elasticsearch): void
     {
         try {
+            // Renew once up front so the acquire->first-stage window (a queued
+            // sequential import waiting for a worker) cannot let the lease lapse
+            // before the loop below starts renewing per stage.
+            if ($this->lockOwner !== null) {
+                ImportLock::renew($this->source->searchableAs(), $this->lockOwner, $this->lockTtl);
+            }
             $stages = $this->stages();
             $estimate = $stages->sum->estimate();
             $this->progressBar()->setMaxSteps($estimate);
@@ -93,6 +99,6 @@ final class Import
 
     private function stages(): Collection
     {
-        return ImportStages::fromSource($this->source, $this->profile);
+        return ImportStages::fromSource($this->source, $this->profile, $this->lockOwner);
     }
 }

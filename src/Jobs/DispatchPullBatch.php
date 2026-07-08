@@ -130,11 +130,34 @@ final class DispatchPullBatch implements ShouldQueue
             ], $this->lockTtl);
         }
 
+        // Renew before the planning key scan below (which can take a while on a
+        // large table without --fast-plan), so the lease cannot lapse while we
+        // plan. A second renew after the scan lives further down.
+        if ($this->lockOwner !== null) {
+            ImportLock::renew($this->source->searchableAs(), $this->lockOwner, $this->lockTtl);
+        }
+
+        // Opt-in retry for the fanned-out chunk jobs. Default tries=1 reproduces
+        // today's behaviour (a chunk that throws fails immediately). Only the
+        // chunk jobs carry this — the prepare stages must never retry, since
+        // CreateWriteIndex is non-idempotent. The chunk re-index is idempotent
+        // (stable doc ids overwrite), so once enabled a transient failure (e.g.
+        // a job_batches lock-wait timeout raised in worker bookkeeping) is
+        // retried with backoff instead of cancelling the whole batch.
         $timeout = $this->timeout;
+        $tries = max(1, (int) config('elasticsearch.import.batch.tries', 1));
+        $backoffBase = (int) config('elasticsearch.import.batch.backoff_base', 5);
+        $backoffCap = (int) config('elasticsearch.import.batch.backoff_cap', 120);
+        $retryUntil = ((int) config('elasticsearch.import.batch.retry_until', 0)) ?: null;
+
         $chunkJobs = PullFromSource::chunked($this->source, $this->profile)
-            ->map(function ($stage) use ($timeout) {
+            ->map(function ($stage) use ($timeout, $tries, $backoffBase, $backoffCap, $retryUntil) {
                 $job = new StageJob($stage);
                 $job->timeout = $timeout;
+                $job->tries = $tries;
+                $job->backoffBase = $backoffBase;
+                $job->backoffCap = $backoffCap;
+                $job->retryUntilSeconds = $retryUntil;
 
                 return $job;
             })
@@ -168,6 +191,15 @@ final class DispatchPullBatch implements ShouldQueue
             return;
         }
 
+        // One line per import so the chunk count (which drives job_batches
+        // bookkeeping contention) can be correlated with any lock-wait incidents.
+        logger()->info('scout:import dispatching parallel batch', [
+            'searchable' => $searchableAs,
+            'chunks' => count($chunkJobs),
+            'connection' => $this->batchConnection,
+            'queue' => $this->batchQueue,
+        ]);
+
         $batch = Bus::batch($chunkJobs)
             ->name('scout-import:'.$searchableAs)
             // Fires after each chunk completes: heartbeat the lease so imports
@@ -182,16 +214,27 @@ final class DispatchPullBatch implements ShouldQueue
             ->then(function (Batch $batch) use ($source, $index) {
                 self::finalize($source, $index);
             })
-            // A failed chunk means we never swap: the old index keeps serving.
-            // Remove the half-filled index we created but never promoted so it
-            // does not linger and consume cluster resources.
-            ->catch(function (Batch $batch, Throwable $e) use ($source, $index) {
+            // A failed chunk cancels the batch: we never swap, so the old index
+            // keeps serving. Just report the triggering failure here — the
+            // rollback (deleting the half-filled index) is deferred to finally()
+            // so it cannot race chunks that are still draining.
+            ->catch(function (Batch $batch, Throwable $e) use ($searchableAs) {
                 report($e);
-                self::removeUnpromotedIndex($source, $index);
+                logger()->error('scout:import batch cancelled', [
+                    'searchable' => $searchableAs,
+                    'exception' => get_class($e),
+                    'message' => $e->getMessage(),
+                ]);
             })
-            // Always runs after then/catch, so the alias swap (success) or the
-            // rollback (failure) has completed by the time the lock is released.
-            ->finally(function (Batch $batch) use ($searchableAs, $owner) {
+            // Runs once the batch is fully settled — every chunk, including the
+            // ones SkipIfBatchCancelled no-op'd, has been processed. Deleting the
+            // unpromoted index here therefore cannot race an in-flight write, and
+            // only happens when the batch actually failed. The lock is released
+            // last, after the swap (success) or rollback (failure) has completed.
+            ->finally(function (Batch $batch) use ($source, $index, $searchableAs, $owner) {
+                if ($batch->cancelled()) {
+                    self::removeUnpromotedIndex($source, $index, $owner);
+                }
                 if ($owner !== null) {
                     ImportLock::release($searchableAs, $owner);
                 }
@@ -223,8 +266,19 @@ final class DispatchPullBatch implements ShouldQueue
     private static function finalize(ImportSource $source, Index $index): void
     {
         $elasticsearch = app(Client::class);
-        (new RefreshIndex($index))->handle($elasticsearch);
-        (new SwitchToNewAndRemoveOldIndex($source, $index))->handle($elasticsearch);
+        try {
+            (new RefreshIndex($index))->handle($elasticsearch);
+            (new SwitchToNewAndRemoveOldIndex($source, $index))->handle($elasticsearch);
+        } catch (Missing404Exception $e) {
+            // The concrete index vanished before we could promote it — a
+            // superseding run of the same model deleted it out from under us.
+            // There is nothing left to promote, so log and abort instead of
+            // throwing a raw 404 out of the batch then() callback. Narrow catch:
+            // any other error (mapping conflict, cluster error) still propagates.
+            logger()->warning('scout:import finalize aborted: target index vanished', [
+                'index' => $index->name(),
+            ]);
+        }
     }
 
     /**
@@ -245,7 +299,7 @@ final class DispatchPullBatch implements ShouldQueue
      * The live read alias is unaffected: it still points at the old index,
      * which this method never names.
      */
-    public static function removeUnpromotedIndex(ImportSource $source, Index $index): void
+    public static function removeUnpromotedIndex(ImportSource $source, Index $index, ?string $owner = null): void
     {
         $name = $index->name();
         $expectedPrefix = $source->searchableAs().'_';
@@ -254,6 +308,18 @@ final class DispatchPullBatch implements ShouldQueue
         $belongsToModel = strpos($name, $expectedPrefix) === 0 && strlen($name) > strlen($expectedPrefix);
 
         if ($isMultiTarget || ! $belongsToModel) {
+            return;
+        }
+
+        // If our lease has lapsed and another run now owns this model, that run
+        // is responsible for its own index — do not delete on its behalf. Our
+        // own frozen name is unique per run (Index::fromSource), so this is
+        // belt-and-suspenders on top of the name checks above.
+        if ($owner !== null && ! ImportLock::isHeldBy($source->searchableAs(), $owner)) {
+            logger()->warning('scout:import rollback skipped: no longer lock owner', [
+                'index' => $name,
+            ]);
+
             return;
         }
 

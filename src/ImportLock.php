@@ -48,6 +48,19 @@ final class ImportLock
     }
 
     /**
+     * Whether the given owner still holds the lease for this searchable. Lets a
+     * destructive stage (CleanUp, the batch rollback) confirm it is still the
+     * active run before deleting an index — if the lease has lapsed and been
+     * re-acquired by another run, this returns false and the caller must not
+     * delete an index that now belongs to someone else. Deliberately a predicate
+     * rather than a getter so the owner token is never exposed.
+     */
+    public static function isHeldBy(string $searchableAs, string $owner): bool
+    {
+        return Cache::get(self::keyFor($searchableAs)) === $owner;
+    }
+
+    /**
      * Atomically claim the lease without blocking. Returns the owner token on
      * success (needed to renew/release it later, possibly from a queue worker in
      * another process) or null when another import already holds it.

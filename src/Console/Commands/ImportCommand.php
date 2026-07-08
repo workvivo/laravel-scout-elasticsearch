@@ -403,8 +403,14 @@ final class ImportCommand extends Command
         $index = Index::fromSource($source);
         $timeout = Config::queueTimeout();
 
-        $cleanUp = new StageJob(new CleanUp($source));
-        $createIndex = new StageJob(new CreateWriteIndex($source, $index));
+        // Pass the lock owner so CleanUp refuses to delete a write index once
+        // our lease has lapsed, and renew the lease as each prepare stage begins
+        // so the (otherwise unrenewed) clean-up + create-index + planning window
+        // cannot expire and admit a second, overlapping run of the same model.
+        $cleanUp = (new StageJob(new CleanUp($source, $owner)))
+            ->withLockRenew($source->searchableAs(), $owner, $ttl);
+        $createIndex = (new StageJob(new CreateWriteIndex($source, $index)))
+            ->withLockRenew($source->searchableAs(), $owner, $ttl);
 
         // With --wait, the prepare stages publish a heartbeat as each begins so
         // waitForBatch can see the chain has been picked up and is progressing

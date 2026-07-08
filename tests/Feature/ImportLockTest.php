@@ -208,6 +208,39 @@ final class ImportLockTest extends IntegrationTestCase
         $this->assertNotNull((new ImportLock('products', 3600))->acquire());
     }
 
+    /**
+     * @test
+     */
+    public function is_held_by_reflects_the_current_owner(): void
+    {
+        $owner = (new ImportLock('products', 3600))->acquire();
+        $this->assertNotNull($owner);
+
+        $this->assertTrue(ImportLock::isHeldBy('products', $owner));
+        $this->assertFalse(ImportLock::isHeldBy('products', 'someone-else'));
+    }
+
+    /**
+     * @test
+     */
+    public function is_held_by_is_false_once_the_lease_is_released(): void
+    {
+        $owner = (new ImportLock('products', 3600))->acquire();
+        $this->assertNotNull($owner);
+
+        ImportLock::release('products', $owner);
+
+        $this->assertFalse(ImportLock::isHeldBy('products', $owner));
+    }
+
+    /**
+     * @test
+     */
+    public function is_held_by_is_false_for_a_never_acquired_model(): void
+    {
+        $this->assertFalse(ImportLock::isHeldBy('never-acquired', 'any-token'));
+    }
+
     public function modes(): array
     {
         return [

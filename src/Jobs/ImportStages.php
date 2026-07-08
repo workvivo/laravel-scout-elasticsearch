@@ -16,14 +16,15 @@ class ImportStages extends Collection
     /**
      * @param  ImportSource  $source
      * @param  bool  $profile
+     * @param  string|null  $owner
      * @return Collection
      */
-    public static function fromSource(ImportSource $source, bool $profile = false)
+    public static function fromSource(ImportSource $source, bool $profile = false, ?string $owner = null)
     {
         $index = Index::fromSource($source);
 
         return (new self([
-            new CleanUp($source),
+            new CleanUp($source, $owner),
             new CreateWriteIndex($source, $index),
             PullFromSource::chunked($source, $profile),
             new RefreshIndex($index),

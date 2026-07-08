@@ -89,11 +89,19 @@ final class DefaultImportSource implements ImportSource
 
     public function chunked(): Collection
     {
-        // Guard against a misconfigured chunk size: 0 or a negative value would
-        // make limit($chunkSize) return nothing, leaving $bounds empty and
-        // silently importing into an empty index. A per-run override (the
-        // command's --chunk option) takes precedence over the config.
-        $chunkSize = max(1, (int) ($this->chunkSize ?? config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE)));
+        // Resolve the chunk size with clear precedence: the per-run --chunk
+        // override, then a per-model config entry, then a package-wide default,
+        // then Scout's global default (500). Fewer, larger chunks mean fewer
+        // batch completions and therefore less job_batches lock contention on
+        // large tables. Absent config keys reproduce today's behaviour exactly.
+        // Guard against a misconfigured 0/negative value, which would make
+        // limit($chunkSize) return nothing and silently import into an empty
+        // index.
+        $chunkSize = $this->chunkSize
+            ?? config("elasticsearch.import.chunk.{$this->searchableAs()}")
+            ?? config('elasticsearch.import.chunk.default')
+            ?? config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
+        $chunkSize = max(1, (int) $chunkSize);
         $key = $this->model()->getQualifiedKeyName();
 
         // Auto-increment integer PKs are the common case, and they let us plan

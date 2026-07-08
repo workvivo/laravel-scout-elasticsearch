@@ -2,6 +2,7 @@
 
 namespace Matchish\ScoutElasticSearch\ElasticSearch;
 
+use Illuminate\Support\Str;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
 /**
@@ -86,7 +87,14 @@ final class Index
 
     public static function fromSource(ImportSource $source): Index
     {
-        $name = $source->searchableAs().'_'.time();
+        // time() alone is 1-second resolution, so two overlapping runs of the
+        // same model could mint the *identical* concrete index name — which
+        // breaks the "I only ever delete my own frozen index" guarantee that
+        // the rollback / clean-up safety relies on. The random suffix makes the
+        // name unique per run while keeping the "{searchableAs}_" prefix that
+        // removeUnpromotedIndex() and CleanUp depend on. Lower-cased because
+        // Elasticsearch/OpenSearch index names must be lowercase.
+        $name = $source->searchableAs().'_'.time().'_'.Str::lower(Str::random(6));
         $settingsConfigKey = "elasticsearch.indices.settings.{$source->searchableAs()}";
         $mappingsConfigKey = "elasticsearch.indices.mappings.{$source->searchableAs()}";
         $defaultSettings = [
