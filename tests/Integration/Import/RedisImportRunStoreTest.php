@@ -7,6 +7,8 @@ namespace Tests\Integration\Import;
 use Matchish\ScoutElasticSearch\Import\ImportRunStore;
 use Matchish\ScoutElasticSearch\Import\RedisImportRunStore;
 use Orchestra\Testbench\TestCase;
+use Predis\Cluster\RedisStrategy;
+use ReflectionMethod;
 
 final class RedisImportRunStoreTest extends TestCase
 {
@@ -39,6 +41,46 @@ final class RedisImportRunStoreTest extends TestCase
         $this->assertFalse($this->store->failIfNotDone($token, 0));
         $this->assertTrue($this->store->failIfNotDone($token, 1));
         $this->assertSame(ImportRunStore::STATUS_FAILED, $this->store->status($token));
+    }
+
+    /**
+     * @test
+     */
+    public function keys_use_a_hash_tag_so_multi_key_lua_is_redis_cluster_safe(): void
+    {
+        $key = new ReflectionMethod(RedisImportRunStore::class, 'key');
+        $key->setAccessible(true);
+
+        $keys = [
+            $key->invoke($this->store, 'run-token', 'status'),
+            $key->invoke($this->store, 'run-token', 'done'),
+            $key->invoke($this->store, 'run-token', 'total'),
+            $key->invoke($this->store, 'run-token', 'index'),
+            $key->invoke($this->store, 'run-token', 'finalize'),
+        ];
+
+        $this->assertSame([
+            'scout:import:run:{run-token}:status',
+            'scout:import:run:{run-token}:done',
+            'scout:import:run:{run-token}:total',
+            'scout:import:run:{run-token}:index',
+            'scout:import:run:{run-token}:finalize',
+        ], $keys);
+
+        $strategy = new RedisStrategy();
+        $slots = array_unique(array_map(function (string $key) use ($strategy) {
+            return $strategy->getSlotByKey($key);
+        }, $keys));
+
+        $this->assertCount(1, $slots);
+    }
+
+    /**
+     * @test
+     */
+    public function supports_atomic_coordination_runs_a_multi_key_probe(): void
+    {
+        $this->assertTrue($this->store->supportsAtomicCoordination());
     }
 
     /**

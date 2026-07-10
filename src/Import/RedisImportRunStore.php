@@ -71,6 +71,15 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 LUA;
 
+    private const SUPPORTS_COORDINATION_SCRIPT = <<<'LUA'
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SADD', KEYS[2], ARGV[2])
+local ok = redis.call('GET', KEYS[1]) == ARGV[1] and redis.call('SCARD', KEYS[2]) == 1
+redis.call('DEL', KEYS[1], KEYS[2])
+if ok then return 1 end
+return 0
+LUA;
+
     private Connection $connection;
 
     public function __construct(RedisFactory $redis)
@@ -191,9 +200,12 @@ LUA;
     public function supportsAtomicCoordination(): bool
     {
         try {
-            $this->connection->ping();
+            $token = 'probe-'.bin2hex(random_bytes(8));
 
-            return true;
+            return (int) $this->eval(self::SUPPORTS_COORDINATION_SCRIPT, [
+                $this->key($token, 'probe'),
+                $this->key($token, 'probe_set'),
+            ], ['1', 'member']) === 1;
         } catch (\Throwable $e) {
             return false;
         }
@@ -201,7 +213,7 @@ LUA;
 
     private function key(string $token, string $suffix): string
     {
-        return 'scout:import:run:'.$token.':'.$suffix;
+        return 'scout:import:run:{'.$token.'}:'.$suffix;
     }
 
     private function eval(string $script, array $keys, array $args = [])

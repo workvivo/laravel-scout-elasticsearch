@@ -211,10 +211,14 @@ tracked in a Redis run record, and the per-model import lock still needs an
 atomic cache store; the file cache driver is not supported for parallel imports.
 Laravel may connect to Redis through either Predis or PhpRedis. This package's
 test suite uses Predis so the Redis coordinator tests do not require the PHP
-Redis extension.
+Redis extension. Redis Cluster is supported: all per-run coordinator keys use a
+`{run-token}` hash tag so the multi-key Lua transitions execute in one hash slot.
 
 The included Docker Compose and GitHub Actions test environments start Redis
 alongside MySQL and OpenSearch and run PHPUnit with `REDIS_CLIENT=predis`.
+The Redis integration tests run the coordinator Lua transitions against Redis
+and assert, using Predis' Redis Cluster slot calculation, that every key touched
+by a run maps to the same cluster slot.
 
 `--parallel` does **not** require `scout.queue` (that flag only governs per-model
 index syncs). It resolves its queue connection from `--connection`, then the
