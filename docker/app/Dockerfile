@@ -4,6 +4,7 @@ ARG TIMEZONE=UTC
 RUN apt-get update && apt-get install -y \
     openssl \
     git \
+    curl \
     unzip \
     default-mysql-client \
     && docker-php-ext-install pdo_mysql \
