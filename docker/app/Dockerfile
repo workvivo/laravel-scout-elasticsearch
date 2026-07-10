@@ -1,13 +1,14 @@
-# See https://github.com/docker-library/php/blob/master/7.1/fpm/Dockerfile
-FROM php:8.3-fpm as php
-ARG TIMEZONE
-
-MAINTAINER Shliakhov Sergey <shlyakhov.up@gmail.com>
+FROM php:8.3-fpm AS php
+ARG TIMEZONE=UTC
 
 RUN apt-get update && apt-get install -y \
     openssl \
     git \
-    unzip
+    curl \
+    unzip \
+    default-mysql-client \
+    && docker-php-ext-install pdo_mysql \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN rm -rf /home/user \
         && mkdir /home/user \
@@ -23,16 +24,20 @@ ENV COMPOSER_HOME /tmp
 
 # Set timezone
 RUN ln -snf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime && echo ${TIMEZONE} > /etc/timezone
-RUN printf '[PHP]\ndate.timezone = "%s"\n', ${TIMEZONE} > /usr/local/etc/php/conf.d/tzone.ini
-RUN "date"
+RUN printf '[PHP]\ndate.timezone = "%s"\n' "${TIMEZONE}" > /usr/local/etc/php/conf.d/tzone.ini
+RUN date
 
-RUN apt-get update && apt-get install -y libmcrypt-dev mariadb-client \
-    && docker-php-ext-install pdo_mysql
-
-FROM php as php-development
-# install xdebug
+FROM php AS php-xdebug
 RUN pecl install xdebug
 RUN docker-php-ext-enable xdebug
+
+FROM php-xdebug AS php-development
+RUN apt-get update && apt-get install -y \
+    procps \
+    telnet \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN echo "error_reporting = E_ALL" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "display_startup_errors = On" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "display_errors = On" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
@@ -43,8 +48,4 @@ RUN echo "xdebug.client_port=9005" >> /usr/local/etc/php/conf.d/docker-php-ext-x
 RUN echo "xdebug.mode=debug" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "xdebug.start_with_request=yes" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 
-RUN apt-get update && apt-get install -y procps
-RUN apt-get update && apt-get install -y telnet
-RUN apt-get update && apt-get install -y net-tools
-
-FROM php as php-testing
+FROM php-xdebug AS php-testing

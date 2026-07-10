@@ -8,29 +8,31 @@ on:
 
 jobs:
     php:
-        name: 'Run tests with php ${{ matrix.php-version }}'
+        name: Run tests with PHP ${{ matrix.php-version }}
         runs-on: ubuntu-latest
 
         strategy:
             fail-fast: false
-            max-parallel: 1  # all versions are using same elasticsearch and mysql service. They need to run 1 by 1.
             matrix:
-                include:
-                    - php-version: '8.0.16'
-                    - php-version: '8.1'
-                    - php-version: '8.2'
-                    - php-version: '8.3'
+                php-version:
+                    - '8.0'
+                    - '8.1'
+                    - '8.2'
+                    - '8.3'
+
         services:
-            elasticsearch:
-                image: docker.elastic.co/elasticsearch/elasticsearch:7.17.1
+            opensearch:
+                image: opensearchproject/opensearch:2.19.3
                 ports:
                     - 9200:9200
                 env:
+                    DISABLE_INSTALL_DEMO_CONFIG: 'true'
+                    DISABLE_SECURITY_PLUGIN: 'true'
                     discovery.type: 'single-node'
-                    xpack.security.enabled: 'false'
+                    OPENSEARCH_JAVA_OPTS: '-Xms512m -Xmx512m'
                 options: --health-cmd="curl http://localhost:9200/_cluster/health" --health-interval=10s --health-timeout=5s --health-retries=5
             mysql:
-                image: mysql:5.7.22
+                image: mysql:8.0
                 env:
                     MYSQL_ALLOW_EMPTY_PASSWORD: yes
                     MYSQL_DATABASE: unittest
@@ -40,7 +42,7 @@ jobs:
 
         steps:
             -   name: Checkout project
-                uses: actions/checkout@v2
+                uses: actions/checkout@v4
 
             -   name: Install and configure PHP
                 uses: shivammathur/setup-php@v2
@@ -50,10 +52,10 @@ jobs:
 
             -   name: Get composer cache directory
                 id: composer-cache-dir
-                run: echo "::set-output name=dir::$(composer config cache-files-dir)"
+                run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
 
             -   name: Cache dependencies
-                uses: actions/cache@v2
+                uses: actions/cache@v4
                 id: composer-cache
                 with:
                     path: ${{ steps.composer-cache-dir.outputs.dir }}
@@ -67,16 +69,9 @@ jobs:
                     composer install --no-interaction --prefer-dist
 
             -   name: Run tests
-                run: vendor/bin/phpunit --coverage-clover=coverage.xml
+                run: XDEBUG_MODE=off vendor/bin/phpunit
                 env:
                     DB_CONNECTION: mysql
                     DB_DATABASE: unittest
                     DB_USERNAME: root
                     ELASTICSEARCH_HOST: '127.0.0.1:9200'
-
-            -   name: Upload coverage to Codecov
-                uses: codecov/codecov-action@v2
-                with:
-                    files: ./coverage.xml
-                    fail_ci_if_error: true
-                    verbose: true

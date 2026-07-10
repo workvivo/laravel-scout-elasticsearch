@@ -1,14 +1,14 @@
 #!/usr/bin/make
-# Makefile readme (ru): <http://linux.yaroslavl.ru/docs/prog/gnu_make_3-79_russian_manual.html>
 # Makefile readme (en): <https://www.gnu.org/software/make/manual/html_node/index.html#SEC_Contents>
 
 SHELL = /bin/sh
 APP_CONTAINER_NAME := app
 
 docker_bin := $(shell command -v docker 2> /dev/null)
-docker_compose_bin := $(shell command -v docker-compose 2> /dev/null)
+docker_compose_bin := $(docker_bin) compose
 
-.PHONY : help test \
+.PHONY : help test analyse test-coverage test-filter test-unit test-local \
+         check-docker check-opensearch-host \
          up down restart shell install
 .DEFAULT_GOAL := help
 
@@ -20,13 +20,30 @@ help: ## Show this help
 
 ---------------: ## ---------------
 
-up: ## Start all containers (in background) for development
-    ifeq ($(OS), Windows_NT)
-	    sudo sysctl -w vm.max_map_count=262144
-    endif
+up: check-docker check-opensearch-host ## Start all containers (in background) for development
 	$(docker_compose_bin) up -d
 
-down: ## Stop all started for development containers
+check-docker:
+	@if [ -z "$(docker_bin)" ]; then \
+		echo "Docker is required. Install Docker Desktop or make sure docker is on PATH."; \
+		exit 1; \
+	fi
+	@if ! $(docker_compose_bin) version >/dev/null 2>&1; then \
+		echo "Docker Compose v2 is required (docker compose). Install the Compose plugin or update Docker Desktop."; \
+		exit 1; \
+	fi
+
+check-opensearch-host:
+	@if [ "$$(uname -s)" = "Linux" ] && [ -r /proc/sys/vm/max_map_count ]; then \
+		current=$$(cat /proc/sys/vm/max_map_count); \
+		if [ "$$current" -lt 262144 ]; then \
+			echo "vm.max_map_count must be at least 262144 for OpenSearch."; \
+			echo "Run: sudo sysctl -w vm.max_map_count=262144"; \
+			exit 1; \
+		fi; \
+	fi
+
+down: check-docker ## Stop all started for development containers
 	$(docker_compose_bin) down
 
 restart: up ## Restart all started for development containers
@@ -39,18 +56,19 @@ install: up ## Install application dependencies into application container
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" composer install --no-interaction --ansi
 
 test: up ## Execute application tests
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpstan analyze --memory-limit=4000M
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit --testdox --stop-on-failure
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --testdox --stop-on-failure'
+
+analyse: up ## Execute static analysis
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpstan analyze --memory-limit=4000M'
 
 test-coverage: up ## Execute application tests and generate report
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpstan analyze
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit  --coverage-html build/coverage-report
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=coverage ./vendor/bin/phpunit --coverage-html build/coverage-report'
 
 test-filter:
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit --filter=$(filter) --testdox
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --filter=$(filter) --testdox'
 
 test-unit:
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure'
 
 test-local: ## Run tests locally without docker (requires native mysql + opensearch)
 	XDEBUG_MODE=off ./vendor/bin/phpunit --testdox
