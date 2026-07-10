@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         TIMEZONE: ${TIMEZONE:-UTC}
-      target: php-${APP_ENV}
+      target: php-${APP_ENV:-testing}
     user: "1000:1000"
     depends_on:
       opensearch:

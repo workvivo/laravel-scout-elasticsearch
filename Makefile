@@ -28,6 +28,10 @@ check-docker:
 		echo "Docker is required. Install Docker Desktop or make sure docker is on PATH."; \
 		exit 1; \
 	fi
+	@if ! $(docker_compose_bin) version >/dev/null 2>&1; then \
+		echo "Docker Compose v2 is required (docker compose). Install the Compose plugin or update Docker Desktop."; \
+		exit 1; \
+	fi
 
 check-opensearch-host:
 	@if [ "$$(uname -s)" = "Linux" ] && [ -r /proc/sys/vm/max_map_count ]; then \
