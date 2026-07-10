@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     && docker-php-ext-install pdo_mysql \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pecl install redis \
+    && docker-php-ext-enable redis
+
 RUN rm -rf /home/user \
         && mkdir /home/user \
         && chmod 777 /home/user

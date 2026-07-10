@@ -21,7 +21,7 @@ help: ## Show this help
 ---------------: ## ---------------
 
 up: check-docker check-opensearch-host ## Start all containers (in background) for development
-	$(docker_compose_bin) up -d
+	$(docker_compose_bin) up -d --build
 
 check-docker:
 	@if [ -z "$(docker_bin)" ]; then \

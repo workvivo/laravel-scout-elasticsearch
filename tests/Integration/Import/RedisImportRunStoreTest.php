@@ -18,13 +18,15 @@ final class RedisImportRunStoreTest extends TestCase
     {
         parent::setUp();
 
+        $this->store = new RedisImportRunStore($this->app['redis']);
+
         try {
-            $this->app['redis']->connection()->ping();
+            if (! $this->store->supportsAtomicCoordination()) {
+                $this->markTestSkipped('Redis is not available for coordinator integration tests.');
+            }
         } catch (\Throwable $e) {
             $this->markTestSkipped('Redis is not available for coordinator integration tests.');
         }
-
-        $this->store = new RedisImportRunStore($this->app['redis']);
     }
 
     /**

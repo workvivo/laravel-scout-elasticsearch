@@ -177,7 +177,7 @@ LUA;
     {
         $key = $this->key($token, 'finalize');
 
-        if ($this->connection->command('set', [$key, $owner, 'EX', $ttlSeconds, 'NX'])) {
+        if ($this->connection->set($key, $owner, 'EX', $ttlSeconds, 'NX')) {
             return true;
         }
 
@@ -224,7 +224,7 @@ LUA;
      */
     private function eval(string $script, array $keys, array $args = []): mixed
     {
-        return $this->connection->command('eval', array_merge([$script, count($keys)], $keys, $args));
+        return $this->connection->eval($script, count($keys), ...array_merge($keys, $args));
     }
 
     private function toInt(mixed $value): int
