@@ -59,7 +59,7 @@ test: up ## Execute application tests
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --testdox --stop-on-failure'
 
 analyse: up ## Execute static analysis
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" ./vendor/bin/phpstan analyze --memory-limit=4000M
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpstan analyze --memory-limit=4000M'
 
 test-coverage: up ## Execute application tests and generate report
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=coverage ./vendor/bin/phpunit --coverage-html build/coverage-report'
