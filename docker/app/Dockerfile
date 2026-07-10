@@ -6,9 +6,6 @@ RUN apt-get update && apt-get install -y \
     git \
     unzip \
     default-mysql-client \
-    procps \
-    telnet \
-    net-tools \
     && docker-php-ext-install pdo_mysql \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,6 +31,12 @@ RUN pecl install xdebug
 RUN docker-php-ext-enable xdebug
 
 FROM php-xdebug AS php-development
+RUN apt-get update && apt-get install -y \
+    procps \
+    telnet \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN echo "error_reporting = E_ALL" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "display_startup_errors = On" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 RUN echo "display_errors = On" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
