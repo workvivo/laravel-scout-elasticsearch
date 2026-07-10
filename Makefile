@@ -7,7 +7,8 @@ APP_CONTAINER_NAME := app
 docker_bin := $(shell command -v docker 2> /dev/null)
 docker_compose_bin := $(docker_bin) compose
 
-.PHONY : help test analyse check-opensearch-host \
+.PHONY : help test analyse test-coverage test-filter test-unit test-local \
+         check-docker check-opensearch-host \
          up down restart shell install
 .DEFAULT_GOAL := help
 
@@ -19,8 +20,14 @@ help: ## Show this help
 
 ---------------: ## ---------------
 
-up: check-opensearch-host ## Start all containers (in background) for development
+up: check-docker check-opensearch-host ## Start all containers (in background) for development
 	$(docker_compose_bin) up -d
+
+check-docker:
+	@if [ -z "$(docker_bin)" ]; then \
+		echo "Docker is required. Install Docker Desktop or make sure docker is on PATH."; \
+		exit 1; \
+	fi
 
 check-opensearch-host:
 	@if [ "$$(uname -s)" = "Linux" ] && [ -r /proc/sys/vm/max_map_count ]; then \
@@ -32,7 +39,7 @@ check-opensearch-host:
 		fi; \
 	fi
 
-down: ## Stop all started for development containers
+down: check-docker ## Stop all started for development containers
 	$(docker_compose_bin) down
 
 restart: up ## Restart all started for development containers
