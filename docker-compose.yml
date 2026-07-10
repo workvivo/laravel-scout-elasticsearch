@@ -12,6 +12,8 @@ services:
         condition: service_healthy
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - /etc/passwd:/etc/passwd:ro
       - /etc/group:/etc/group:ro
@@ -30,6 +32,9 @@ services:
       DB_DATABASE: ${DB_DATABASE}
       DB_USERNAME: ${DB_USERNAME}
       DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     networks:
       - default
 
@@ -47,6 +52,17 @@ services:
       - default
     ports:
       - "3316:3306"
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - default
+
   opensearch:
     image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-2.19.3}
     environment:

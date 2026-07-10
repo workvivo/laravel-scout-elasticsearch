@@ -70,5 +70,5 @@ test-filter:
 test-unit:
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure'
 
-test-local: ## Run tests locally without docker (requires native mysql + opensearch)
+test-local: ## Run tests locally without docker (requires native mysql + opensearch + redis)
 	XDEBUG_MODE=off ./vendor/bin/phpunit --testdox

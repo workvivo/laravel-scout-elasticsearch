@@ -213,6 +213,9 @@ Laravel may connect to Redis through either Predis or PhpRedis. This package's
 test suite uses Predis so the Redis coordinator tests do not require the PHP
 Redis extension.
 
+The included Docker Compose and GitHub Actions test environments start Redis
+alongside MySQL and OpenSearch and run PHPUnit with `REDIS_CLIENT=predis`.
+
 `--parallel` does **not** require `scout.queue` (that flag only governs per-model
 index syncs). It resolves its queue connection from `--connection`, then the
 `scout.queue` connection if set, then your app's **default queue**
