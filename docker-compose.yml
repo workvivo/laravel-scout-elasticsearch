@@ -37,6 +37,7 @@ services:
       REDIS_CLIENT: predis
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      REDIS_CLUSTER_TEST_ENABLED: true
     networks:
       - default
 

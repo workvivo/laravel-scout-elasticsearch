@@ -17,6 +17,10 @@ final class RedisClusterImportRunStoreTest extends TestCase
     {
         parent::setUp();
 
+        if (! env('REDIS_CLUSTER_TEST_ENABLED', false)) {
+            $this->markTestSkipped('Redis Cluster integration tests are not enabled.');
+        }
+
         if (! extension_loaded('redis')) {
             $this->markTestSkipped('The phpredis extension is not available.');
         }
