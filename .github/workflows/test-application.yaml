@@ -110,5 +110,8 @@ jobs:
             -   name: Configure OpenSearch host limits
                 run: sudo sysctl -w vm.max_map_count=262144
 
+            -   name: Install dependencies
+                run: make install
+
             -   name: Run tests
                 run: make test
