@@ -3,6 +3,8 @@
 
 SHELL = /bin/sh
 APP_CONTAINER_NAME := app
+DOCKER_EXEC_USER ?=
+DOCKER_EXEC_USER_FLAG := $(if $(DOCKER_EXEC_USER),--user $(DOCKER_EXEC_USER),)
 
 docker_bin := $(shell command -v docker 2> /dev/null)
 docker_compose_bin := $(docker_bin) compose
@@ -53,7 +55,7 @@ shell: up ## Start shell into application container
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" /bin/sh
 
 install: up ## Install application dependencies into application container
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" composer install --no-interaction --ansi
+	$(docker_compose_bin) exec $(DOCKER_EXEC_USER_FLAG) "$(APP_CONTAINER_NAME)" composer install --no-interaction --ansi
 
 test: up ## Execute application tests
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --testdox --stop-on-failure'

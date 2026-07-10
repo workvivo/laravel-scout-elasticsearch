@@ -110,8 +110,11 @@ jobs:
             -   name: Configure OpenSearch host limits
                 run: sudo sysctl -w vm.max_map_count=262144
 
+            -   name: Configure Docker user
+                run: echo "APP_USER=$(id -u):$(id -g)" >> "$GITHUB_ENV"
+
             -   name: Install dependencies
-                run: make install
+                run: make install DOCKER_EXEC_USER="$APP_USER"
 
             -   name: Run tests
                 run: make test
