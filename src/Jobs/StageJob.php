@@ -61,7 +61,7 @@ final class StageJob implements ShouldQueue
      * the {@see ImportLock} the instant a worker starts running it, keeping the
      * lease alive across the prepare window (clean up + create index + planning)
      * that would otherwise be entirely unrenewed between the command acquiring
-     * the lock and {@see DispatchPullBatch} first renewing it. Deliberately
+     * the lock and {@see DispatchPullChunks} first renewing it. Deliberately
      * independent of {@see withHeartbeat} — the heartbeat only fires under
      * --wait, but the lease must be renewed on every parallel run.
      *
@@ -189,7 +189,7 @@ final class StageJob implements ShouldQueue
         // Prepare stages renew the lease as they begin so a long prepare window
         // (a busy queue between chain hops) cannot let it lapse and admit a
         // second, overlapping run of the same model.
-        if ($this->lockOwner !== null) {
+        if ($this->lockOwner !== null && $this->lockSearchableAs !== null) {
             ImportLock::renew($this->lockSearchableAs, $this->lockOwner, $this->lockRenewTtl);
         }
 

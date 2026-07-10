@@ -4,6 +4,8 @@ namespace Matchish\ScoutElasticSearch\Searchable;
 
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Scope;
 use Illuminate\Support\Collection;
 use Matchish\ScoutElasticSearch\Database\Scopes\ChunkScope;
 
@@ -12,11 +14,11 @@ final class DefaultImportSource implements ImportSource
     const DEFAULT_CHUNK_SIZE = 500;
 
     /**
-     * @var string
+     * @var class-string<Model>
      */
     private $className;
     /**
-     * @var array
+     * @var array<int, Scope>
      */
     private $scopes;
     /**
@@ -41,8 +43,8 @@ final class DefaultImportSource implements ImportSource
     /**
      * DefaultImportSource constructor.
      *
-     * @param  string  $className
-     * @param  array  $scopes
+     * @param  class-string<Model>  $className
+     * @param  array<int, Scope>  $scopes
      * @param  int|null  $chunkSize
      * @param  bool  $fastPlan
      */
@@ -74,19 +76,24 @@ final class DefaultImportSource implements ImportSource
 
     public function syncWithSearchUsingQueue(): ?string
     {
-        return $this->model()->syncWithSearchUsingQueue();
+        return $this->callStringScoutMethod('syncWithSearchUsingQueue');
     }
 
     public function syncWithSearchUsing(): ?string
     {
-        return $this->model()->syncWithSearchUsing();
+        return $this->callStringScoutMethod('syncWithSearchUsing');
     }
 
     public function searchableAs(): string
     {
-        return $this->model()->searchableAs();
+        $searchableAs = $this->callStringScoutMethod('searchableAs');
+
+        return $searchableAs ?? $this->model()->getTable();
     }
 
+    /**
+     * @return Collection<int, ImportSource>
+     */
     public function chunked(): Collection
     {
         // Resolve the chunk size with clear precedence: the per-run --chunk
@@ -101,7 +108,7 @@ final class DefaultImportSource implements ImportSource
             ?? config("elasticsearch.import.chunk.{$this->searchableAs()}")
             ?? config('elasticsearch.import.chunk.default')
             ?? config('scout.chunk.searchable', self::DEFAULT_CHUNK_SIZE);
-        $chunkSize = max(1, (int) $chunkSize);
+        $chunkSize = max(1, is_numeric($chunkSize) ? (int) $chunkSize : self::DEFAULT_CHUNK_SIZE);
         $key = $this->model()->getQualifiedKeyName();
 
         // Auto-increment integer PKs are the common case, and they let us plan
@@ -134,6 +141,8 @@ final class DefaultImportSource implements ImportSource
      * Arithmetic planning: one MIN + one MAX query, then N chunk boundaries
      * generated in memory. Coverage is complete because the fetch still filters
      * per-chunk; sparse keys just produce some lighter (or empty) chunks.
+     *
+     * @return Collection<int, ImportSource>
      */
     private function chunkedArithmetic(string $key, int $chunkSize): Collection
     {
@@ -161,6 +170,10 @@ final class DefaultImportSource implements ImportSource
 
         $max = $planningQuery->max($key);
 
+        if (! is_numeric($max)) {
+            return $this->chunkedSeek($key, $chunkSize);
+        }
+
         $min = (int) $min;
         $max = (int) $max;
 
@@ -168,6 +181,7 @@ final class DefaultImportSource implements ImportSource
         // min+chunkSize-1, and each subsequent boundary steps by chunkSize
         // until we reach (or pass) max. The final boundary is clamped to max
         // so the last chunk always closes exactly on the highest real key.
+        /** @var Collection<int, int> $bounds */
         $bounds = collect();
         $upper = $min + $chunkSize - 1;
         while ($upper < $max) {
@@ -176,12 +190,15 @@ final class DefaultImportSource implements ImportSource
         }
         $bounds->push($max);
 
-        return $bounds->map(function ($end, $index) use ($bounds) {
+        /** @var Collection<int, ImportSource> $chunks */
+        $chunks = $bounds->map(function ($end, $index) use ($bounds) {
             $start = $index === 0 ? null : $bounds->get($index - 1);
             $chunkScope = new ChunkScope($start, $end);
 
             return new static($this->className, array_merge($this->scopes, [$chunkScope]), $this->chunkSize, $this->fastPlan);
         });
+
+        return $chunks;
     }
 
     /**
@@ -190,6 +207,8 @@ final class DefaultImportSource implements ImportSource
      * general-purpose fallback for any key shape (string, UUID, sparse int),
      * where arithmetic over key-space would either be undefined or produce
      * pathologically many empty chunks.
+     *
+     * @return Collection<int, ImportSource>
      */
     private function chunkedSeek(string $key, int $chunkSize): Collection
     {
@@ -203,6 +222,7 @@ final class DefaultImportSource implements ImportSource
         // execute time, can still land here in non-fast-plan mode; the
         // primary ORDER BY on the key stays leftmost so keyset ordering is
         // preserved. In fast-plan mode planningQuery() already strips them.
+        /** @var Collection<int, mixed> $bounds */
         $bounds = collect();
         $last = null;
 
@@ -228,41 +248,46 @@ final class DefaultImportSource implements ImportSource
             return collect();
         }
 
-        return $bounds->map(function ($end, $index) use ($bounds) {
+        /** @var Collection<int, ImportSource> $chunks */
+        $chunks = $bounds->map(function ($end, $index) use ($bounds) {
             $start = $index === 0 ? null : $bounds->get($index - 1);
             $chunkScope = new ChunkScope($start, $end);
 
             return new static($this->className, array_merge($this->scopes, [$chunkScope]), $this->chunkSize, $this->fastPlan);
         });
+
+        return $chunks;
     }
 
     /**
-     * @return mixed
+     * @return Model
      */
-    private function model()
+    private function model(): Model
     {
         return new $this->className;
     }
 
+    /**
+     * @return Builder<Model>
+     */
     private function newQuery(): Builder
     {
+        /** @var Builder<Model> $query */
         $query = $this->className::__callStatic('makeAllSearchableUsing', [$this->model()->newQuery()]);
 
-        $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
+        $softDelete = $this->usesSoftDelete() && config('scout.soft_delete', false);
 
-        $query
-            ->when($softDelete, function ($query) {
-                return $query->withTrashed();
-            })
-            ->orderBy($this->model()->getQualifiedKeyName());
+        if ($softDelete) {
+            $query->{'withTrashed'}();
+        }
 
-        $scopes = $this->scopes;
+        $query->orderBy($this->model()->getQualifiedKeyName());
 
-        return collect($scopes)->reduce(function ($instance, $scope) {
-            $instance->withGlobalScope(get_class($scope), $scope);
+        foreach ($this->scopes as $scope) {
+            $query->withGlobalScope(get_class($scope), $scope);
+        }
 
-            return $instance;
-        }, $query);
+        return $query;
     }
 
     /**
@@ -284,20 +309,40 @@ final class DefaultImportSource implements ImportSource
      * bare keys always covers every key the fetch could return — ranges may be
      * wider (a few lighter chunks), but nothing is skipped, and the fetch still
      * applies the join/filters/scopes so no extra records are indexed.
+     *
+     * @return Builder<Model>
      */
     private function planningQuery(): Builder
     {
         $query = $this->model()->newQuery()->withoutGlobalScopes();
 
-        $softDelete = $this->className::usesSoftDelete() && config('scout.soft_delete', false);
+        $softDelete = $this->usesSoftDelete() && config('scout.soft_delete', false);
 
-        return $query->when($softDelete, function ($query) {
-            return $query->withTrashed();
-        });
+        if ($softDelete) {
+            $query->{'withTrashed'}();
+        }
+
+        return $query;
     }
 
+    /**
+     * @return EloquentCollection<int, Model>
+     */
     public function get(): EloquentCollection
     {
         return $this->newQuery()->get();
+    }
+
+    private function usesSoftDelete(): bool
+    {
+        return method_exists($this->className, 'usesSoftDelete')
+            && (bool) forward_static_call([$this->className, 'usesSoftDelete']);
+    }
+
+    private function callStringScoutMethod(string $method): ?string
+    {
+        $value = $this->model()->{$method}();
+
+        return is_string($value) ? $value : null;
     }
 }

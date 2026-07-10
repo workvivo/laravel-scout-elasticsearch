@@ -97,6 +97,9 @@ final class Import
         }
     }
 
+    /**
+     * @return Collection<int, StageInterface>
+     */
     private function stages(): Collection
     {
         return ImportStages::fromSource($this->source, $this->profile, $this->lockOwner);

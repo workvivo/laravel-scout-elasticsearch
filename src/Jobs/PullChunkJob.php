@@ -107,7 +107,7 @@ final class PullChunkJob implements ShouldQueue
         report($e);
 
         $job = (new RollbackImportJob($this->source, $this->index, $this->lockOwner))
-            ->delay(now()->addSeconds((int) config('elasticsearch.import.rollback_delay', 5)));
+            ->delay(now()->addSeconds($this->rollbackDelay()));
         $job->timeout = Config::queueTimeout();
 
         if ($this->connectionName !== null) {
@@ -117,6 +117,13 @@ final class PullChunkJob implements ShouldQueue
             $job->onQueue($this->queueName);
         }
         Bus::dispatch($job);
+    }
+
+    private function rollbackDelay(): int
+    {
+        $delay = config('elasticsearch.import.rollback_delay', 5);
+
+        return is_numeric($delay) ? (int) $delay : 5;
     }
 
     public function backoff(): array

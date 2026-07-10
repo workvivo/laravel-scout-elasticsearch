@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\Console\Commands\ImportCommand;
-use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
+use Matchish\ScoutElasticSearch\Jobs\DispatchPullChunks;
 use Matchish\ScoutElasticSearch\Jobs\PullChunkJob;
 use Matchish\ScoutElasticSearch\Jobs\StageJob;
 use stdClass;
@@ -147,7 +147,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         Bus::assertChained([
             StageJob::class,
             StageJob::class,
-            DispatchPullBatch::class,
+            DispatchPullChunks::class,
         ]);
     }
 
@@ -186,7 +186,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         $index = \Matchish\ScoutElasticSearch\ElasticSearch\Index::fromSource($source);
 
         // 10 rows, chunk size 10 => a single chunk (vs 4 at the config default 3).
-        (new DispatchPullBatch($source, $index, 'redis', 'reindex', null))->handle();
+        (new DispatchPullChunks($source, $index, 'redis', 'reindex', null))->handle();
 
         Bus::assertDispatched(PullChunkJob::class, 1);
     }
@@ -217,7 +217,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         Bus::assertChained([
             StageJob::class,
             StageJob::class,
-            DispatchPullBatch::class,
+            DispatchPullChunks::class,
         ]);
     }
 
@@ -325,7 +325,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
 
         $token = 'stalled-token';
         Cache::put(
-            DispatchPullBatch::preparingKey($token),
+            DispatchPullChunks::preparingKey($token),
             ['seq' => 2, 'stage' => 'Create write index'],
             60
         );

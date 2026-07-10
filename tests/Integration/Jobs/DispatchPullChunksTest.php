@@ -7,16 +7,19 @@ namespace Tests\Integration\Jobs;
 use App\Product;
 use Illuminate\Support\Facades\Bus;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
+use Matchish\ScoutElasticSearch\Import\ImportRunStore;
 use Matchish\ScoutElasticSearch\ImportLock;
-use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
+use Matchish\ScoutElasticSearch\Jobs\DispatchPullChunks;
 use Matchish\ScoutElasticSearch\Jobs\FinalizeJob;
 use Matchish\ScoutElasticSearch\Jobs\PullChunkJob;
 use Matchish\ScoutElasticSearch\Jobs\RollbackImportJob;
+use Matchish\ScoutElasticSearch\Jobs\Stages\PullFromSource;
 use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
+use RuntimeException;
 use stdClass;
 use Tests\IntegrationTestCase;
 
-final class DispatchPullBatchTest extends IntegrationTestCase
+final class DispatchPullChunksTest extends IntegrationTestCase
 {
     private function withoutModelEvents(string $class, callable $callback): void
     {
@@ -45,7 +48,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $source = $this->source();
         $index = Index::fromSource($source);
 
-        (new DispatchPullBatch($source, $index, 'redis', 'reindex', 'owner-token', 900))->handle();
+        (new DispatchPullChunks($source, $index, 'redis', 'reindex', 'owner-token', 900))->handle();
 
         Bus::assertDispatched(PullChunkJob::class, 4);
         Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
@@ -63,7 +66,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $source = $this->source();
         $index = Index::fromSource($source);
 
-        (new DispatchPullBatch($source, $index, null, null, 'owner-token', 900))->handle();
+        (new DispatchPullChunks($source, $index, null, null, 'owner-token', 900))->handle();
 
         Bus::assertDispatched(FinalizeJob::class);
         Bus::assertNotDispatched(PullChunkJob::class);
@@ -187,6 +190,69 @@ final class DispatchPullBatchTest extends IntegrationTestCase
     /**
      * @test
      */
+    public function failed_chunk_marks_the_run_failed_and_dispatches_rollback(): void
+    {
+        Bus::fake();
+
+        $source = $this->source();
+        $index = Index::fromSource($source);
+        $store = app(ImportRunStore::class);
+        $store->start('failed-chunk-token', 2, $index->name());
+
+        $job = new PullChunkJob(
+            $source,
+            new PullFromSource($source),
+            $index,
+            'failed-chunk-token',
+            1,
+            'owner-token',
+            900,
+            'redis',
+            'reindex'
+        );
+
+        $job->failed(new RuntimeException('chunk failed'));
+
+        $this->assertSame(ImportRunStore::STATUS_FAILED, $store->status('failed-chunk-token'));
+        Bus::assertDispatched(RollbackImportJob::class, function (RollbackImportJob $job) {
+            return $job->connection === 'redis' && $job->queue === 'reindex';
+        });
+    }
+
+    /**
+     * @test
+     */
+    public function failed_chunk_does_not_roll_back_after_that_chunk_is_already_done(): void
+    {
+        Bus::fake();
+
+        $source = $this->source();
+        $index = Index::fromSource($source);
+        $store = app(ImportRunStore::class);
+        $store->start('done-chunk-token', 1, $index->name());
+        $store->markDone('done-chunk-token', 0);
+
+        $job = new PullChunkJob(
+            $source,
+            new PullFromSource($source),
+            $index,
+            'done-chunk-token',
+            0,
+            'owner-token',
+            900,
+            'redis',
+            'reindex'
+        );
+
+        $job->failed(new RuntimeException('late failure'));
+
+        $this->assertSame(ImportRunStore::STATUS_RUNNING, $store->status('done-chunk-token'));
+        Bus::assertNotDispatched(RollbackImportJob::class);
+    }
+
+    /**
+     * @test
+     */
     public function per_model_chunk_config_controls_the_number_of_chunks(): void
     {
         Bus::fake();
@@ -198,7 +264,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
 
         $source = $this->source();
         $index = Index::fromSource($source);
-        (new DispatchPullBatch($source, $index, null, null, 'owner-token', 900))->handle();
+        (new DispatchPullChunks($source, $index, null, null, 'owner-token', 900))->handle();
 
         // 10 rows / per-model chunk 5 => 2 chunks (the test config default is 3).
         Bus::assertDispatched(PullChunkJob::class, 2);
@@ -216,7 +282,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         });
 
         $source = $this->source();
-        (new DispatchPullBatch($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
+        (new DispatchPullChunks($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
 
         Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
             return $job->tries === 1 && $job->backoff() === [];
@@ -238,7 +304,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         });
 
         $source = $this->source();
-        (new DispatchPullBatch($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
+        (new DispatchPullChunks($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
 
         Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
             return $job->tries === 7 && $job->backoffBase === 3 && $job->backoffCap === 30;

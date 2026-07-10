@@ -33,12 +33,12 @@ return [
         // visibility timeout) greater than `queue.timeout` above, or the queue
         // will re-run a still-running chunk and trip MaxAttemptsExceeded.
         'retry' => [
-            'tries' => (int) env('SCOUT_IMPORT_RETRY_TRIES', env('SCOUT_IMPORT_BATCH_TRIES', 1)),
-            'backoff_base' => (int) env('SCOUT_IMPORT_RETRY_BACKOFF_BASE', env('SCOUT_IMPORT_BATCH_BACKOFF_BASE', 5)),
-            'backoff_cap' => (int) env('SCOUT_IMPORT_RETRY_BACKOFF_CAP', env('SCOUT_IMPORT_BATCH_BACKOFF_CAP', 120)),
+            'tries' => (int) env('SCOUT_IMPORT_RETRY_TRIES', 1),
+            'backoff_base' => (int) env('SCOUT_IMPORT_RETRY_BACKOFF_BASE', 5),
+            'backoff_cap' => (int) env('SCOUT_IMPORT_RETRY_BACKOFF_CAP', 120),
             // Optional wall-clock ceiling per chunk, in seconds (0 = bounded by
             // tries only).
-            'retry_until' => (int) env('SCOUT_IMPORT_RETRY_UNTIL', env('SCOUT_IMPORT_BATCH_RETRY_UNTIL', 0)),
+            'retry_until' => (int) env('SCOUT_IMPORT_RETRY_UNTIL', 0),
         ],
         'rollback_delay' => (int) env('SCOUT_IMPORT_ROLLBACK_DELAY', 5),
 

@@ -84,7 +84,8 @@ LUA;
 
     public function __construct(RedisFactory $redis)
     {
-        $this->connection = $redis->connection(config('elasticsearch.import.redis.connection'));
+        $connection = config('elasticsearch.import.redis.connection');
+        $this->connection = $redis->connection(is_string($connection) ? $connection : null);
     }
 
     public function start(string $token, int $total, string $index): void
@@ -98,9 +99,9 @@ LUA;
 
     public function markDone(string $token, int $chunkId): int
     {
-        return (int) $this->eval(self::MARK_DONE_SCRIPT, [
+        return $this->toInt($this->eval(self::MARK_DONE_SCRIPT, [
             $this->key($token, 'done'),
-        ], [(string) $chunkId]);
+        ], [(string) $chunkId]));
     }
 
     public function isDone(string $token, int $chunkId): bool
@@ -110,7 +111,7 @@ LUA;
 
     public function total(string $token): int
     {
-        return (int) ($this->connection->get($this->key($token, 'total')) ?? 0);
+        return $this->toInt($this->connection->get($this->key($token, 'total')));
     }
 
     public function status(string $token): ?string
@@ -141,42 +142,42 @@ LUA;
 
     public function failIfNotDone(string $token, int $chunkId): bool
     {
-        return (int) $this->eval(self::FAIL_IF_NOT_DONE_SCRIPT, [
+        return $this->toInt($this->eval(self::FAIL_IF_NOT_DONE_SCRIPT, [
             $this->key($token, 'status'),
             $this->key($token, 'done'),
-        ], [(string) $chunkId]) === 1;
+        ], [(string) $chunkId])) === 1;
     }
 
     public function claimFinalization(string $token): bool
     {
-        return (int) $this->eval(self::CLAIM_FINALIZATION_SCRIPT, [
+        return $this->toInt($this->eval(self::CLAIM_FINALIZATION_SCRIPT, [
             $this->key($token, 'status'),
             $this->key($token, 'done'),
             $this->key($token, 'total'),
-        ]) === 1;
+        ])) === 1;
     }
 
     public function succeedIfFinalizing(string $token, string $lockOwner): bool
     {
-        return (int) $this->eval(self::SUCCEED_SCRIPT, [
+        return $this->toInt($this->eval(self::SUCCEED_SCRIPT, [
             $this->key($token, 'status'),
             $this->key($token, 'finalize'),
-        ], [$lockOwner]) === 1;
+        ], [$lockOwner])) === 1;
     }
 
     public function finalizeFailedIfFinalizing(string $token, string $lockOwner): bool
     {
-        return (int) $this->eval(self::FINALIZE_FAILED_SCRIPT, [
+        return $this->toInt($this->eval(self::FINALIZE_FAILED_SCRIPT, [
             $this->key($token, 'status'),
             $this->key($token, 'finalize'),
-        ], [$lockOwner]) === 1;
+        ], [$lockOwner])) === 1;
     }
 
     public function acquireFinalizeLock(string $token, string $owner, int $ttlSeconds): bool
     {
         $key = $this->key($token, 'finalize');
 
-        if ($this->connection->set($key, $owner, 'EX', $ttlSeconds, 'NX')) {
+        if ($this->connection->command('set', [$key, $owner, 'EX', $ttlSeconds, 'NX'])) {
             return true;
         }
 
@@ -185,9 +186,9 @@ LUA;
 
     public function renewFinalizeLock(string $token, string $owner, int $ttlSeconds): bool
     {
-        return (int) $this->eval(self::RENEW_LOCK_SCRIPT, [
+        return $this->toInt($this->eval(self::RENEW_LOCK_SCRIPT, [
             $this->key($token, 'finalize'),
-        ], [$owner, (string) $ttlSeconds]) === 1;
+        ], [$owner, (string) $ttlSeconds])) === 1;
     }
 
     public function releaseFinalizeLock(string $token, string $owner): void
@@ -202,10 +203,10 @@ LUA;
         try {
             $token = 'probe-'.bin2hex(random_bytes(8));
 
-            return (int) $this->eval(self::SUPPORTS_COORDINATION_SCRIPT, [
+            return $this->toInt($this->eval(self::SUPPORTS_COORDINATION_SCRIPT, [
                 $this->key($token, 'probe'),
                 $this->key($token, 'probe_set'),
-            ], ['1', 'member']) === 1;
+            ], ['1', 'member'])) === 1;
         } catch (\Throwable $e) {
             return false;
         }
@@ -216,8 +217,18 @@ LUA;
         return 'scout:import:run:{'.$token.'}:'.$suffix;
     }
 
-    private function eval(string $script, array $keys, array $args = [])
+    /**
+     * @param  string[]  $keys
+     * @param  string[]  $args
+     * @return mixed
+     */
+    private function eval(string $script, array $keys, array $args = []): mixed
     {
-        return $this->connection->eval($script, count($keys), ...array_merge($keys, $args));
+        return $this->connection->command('eval', array_merge([$script, count($keys)], $keys, $args));
+    }
+
+    private function toInt(mixed $value): int
+    {
+        return is_numeric($value) ? (int) $value : 0;
     }
 }

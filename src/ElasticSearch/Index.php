@@ -105,6 +105,6 @@ final class Index
         $settings = config($settingsConfigKey, config('elasticsearch.indices.settings.default', $defaultSettings));
         $mappings = config($mappingsConfigKey, config('elasticsearch.indices.mappings.default'));
 
-        return new static($name, $settings, $mappings);
+        return new static($name, is_array($settings) ? $settings : null, is_array($mappings) ? $mappings : null);
     }
 }

@@ -3,6 +3,7 @@
 namespace Matchish\ScoutElasticSearch\Jobs\Stages;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
@@ -46,13 +47,11 @@ final class PullFromSource implements StageInterface
             return;
         }
 
-        $results = $this->source->get()->filter(function ($item) {
-            return $item->shouldBeSearchable();
+        $results = $this->source->get()->filter(function (Model $item): bool {
+            return $this->shouldBeSearchable($item);
         });
 
-        if (! $results->isEmpty()) {
-            $results->first()->searchableUsing()->update($results);
-        }
+        $this->updateSearchIndex($results);
     }
 
     /**
@@ -96,8 +95,8 @@ final class PullFromSource implements StageInterface
             $t1 = microtime(true);
 
             [$results, $filterQueries] = $countQueries(function () use ($fetched) {
-                return $fetched->filter(function ($item) {
-                    return $item->shouldBeSearchable();
+                return $fetched->filter(function (Model $item): bool {
+                    return $this->shouldBeSearchable($item);
                 });
             });
             $t2 = microtime(true);
@@ -125,7 +124,7 @@ final class PullFromSource implements StageInterface
                 // so bulk_ms is an upper bound on the network/cluster time —
                 // subtract serialize_ms for the real round-trip estimate.
                 $b0 = microtime(true);
-                $results->first()->searchableUsing()->update($results);
+                $this->updateSearchIndex($results);
                 $bulkMs = (microtime(true) - $b0) * 1000;
 
                 $indexed = $results->count();
@@ -177,12 +176,30 @@ final class PullFromSource implements StageInterface
     /**
      * @param  ImportSource  $source
      * @param  bool  $profile
-     * @return Collection
+     * @return Collection<int, self>
      */
     public static function chunked(ImportSource $source, bool $profile = false): Collection
     {
-        return $source->chunked()->map(function ($chunk) use ($profile) {
+        return $source->chunked()->map(function (ImportSource $chunk) use ($profile): self {
             return new static($chunk, $profile);
         });
+    }
+
+    private function shouldBeSearchable(Model $model): bool
+    {
+        return (bool) $model->{'shouldBeSearchable'}();
+    }
+
+    /**
+     * @param  EloquentCollection<int, Model>  $models
+     */
+    private function updateSearchIndex(EloquentCollection $models): void
+    {
+        if ($models->isEmpty()) {
+            return;
+        }
+
+        $engine = $models->first()->{'searchableUsing'}();
+        $engine->update($models);
     }
 }

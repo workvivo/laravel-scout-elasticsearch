@@ -70,7 +70,6 @@ final class ImportLockTest extends IntegrationTestCase
         // Skips cleanly (exit 0) and dispatches no work for the locked model.
         $this->assertEquals(0, $exitCode);
         Bus::assertNothingDispatched();
-        Bus::assertNothingBatched();
     }
 
     /**

@@ -46,6 +46,22 @@ final class RedisImportRunStoreTest extends TestCase
     /**
      * @test
      */
+    public function duplicate_chunk_completion_is_idempotent(): void
+    {
+        $token = 'test-run-'.bin2hex(random_bytes(8));
+
+        $this->store->start($token, 2, 'products_1');
+
+        $this->assertSame(1, $this->store->markDone($token, 0));
+        $this->assertSame(1, $this->store->markDone($token, 0));
+        $this->assertSame(1, $this->store->snapshot($token)['done']);
+
+        $this->assertSame(2, $this->store->markDone($token, 1));
+    }
+
+    /**
+     * @test
+     */
     public function keys_use_a_hash_tag_so_multi_key_lua_is_redis_cluster_safe(): void
     {
         $key = new ReflectionMethod(RedisImportRunStore::class, 'key');

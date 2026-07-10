@@ -11,24 +11,30 @@ use Matchish\ScoutElasticSearch\Jobs\Stages\RefreshIndex;
 use Matchish\ScoutElasticSearch\Jobs\Stages\SwitchToNewAndRemoveOldIndex;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 
+/**
+ * @extends Collection<int, \Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface>
+ */
 class ImportStages extends Collection
 {
     /**
      * @param  ImportSource  $source
      * @param  bool  $profile
      * @param  string|null  $owner
-     * @return Collection
+     * @return Collection<int, \Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface>
      */
     public static function fromSource(ImportSource $source, bool $profile = false, ?string $owner = null)
     {
         $index = Index::fromSource($source);
 
-        return (new self([
+        /** @var array<int, \Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface> $pullStages */
+        $pullStages = PullFromSource::chunked($source, $profile)->all();
+
+        return new self(array_merge([
             new CleanUp($source, $owner),
             new CreateWriteIndex($source, $index),
-            PullFromSource::chunked($source, $profile),
+        ], $pullStages, [
             new RefreshIndex($index),
             new SwitchToNewAndRemoveOldIndex($source, $index, $owner),
-        ]))->flatten()->filter();
+        ]));
     }
 }

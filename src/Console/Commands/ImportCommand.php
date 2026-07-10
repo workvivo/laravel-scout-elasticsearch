@@ -13,7 +13,7 @@ use Matchish\ScoutElasticSearch\ElasticSearch\Config\Config;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
 use Matchish\ScoutElasticSearch\Import\ImportRunStore;
 use Matchish\ScoutElasticSearch\ImportLock;
-use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
+use Matchish\ScoutElasticSearch\Jobs\DispatchPullChunks;
 use Matchish\ScoutElasticSearch\Jobs\Import;
 use Matchish\ScoutElasticSearch\Jobs\QueueableJob;
 use Matchish\ScoutElasticSearch\Jobs\RollbackImportJob;
@@ -32,7 +32,7 @@ final class ImportCommand extends Command
 
     /**
      * Seconds --wait will poll for the run record to be created (prepare stages +
-     * DispatchPullBatch) before giving up and leaving the work queued.
+     * DispatchPullChunks) before giving up and leaving the work queued.
      */
     const DEFAULT_WAIT_TIMEOUT = 120;
 
@@ -118,9 +118,9 @@ final class ImportCommand extends Command
      */
     private function resolvedConnection(): ?string
     {
-        return $this->option('connection')
-            ?: config('scout.queue.connection')
-            ?: config('queue.default');
+        return $this->stringOption('connection')
+            ?: $this->stringConfig('scout.queue.connection')
+            ?: $this->stringConfig('queue.default');
     }
 
     /**
@@ -130,7 +130,7 @@ final class ImportCommand extends Command
      */
     private function resolvedQueue(): ?string
     {
-        return $this->option('queue') ?: config('scout.queue.queue');
+        return $this->stringOption('queue') ?: $this->stringConfig('scout.queue.queue');
     }
 
     private function isSyncConnection(?string $connection): bool
@@ -142,9 +142,15 @@ final class ImportCommand extends Command
         return config("queue.connections.{$connection}.driver") === 'sync';
     }
 
+    /**
+     * @param  array<int, mixed>  $argument
+     * @return Collection<int, string>
+     */
     private function searchableList(array $argument): Collection
     {
-        return collect($argument)->whenEmpty(function () {
+        return collect($argument)->filter(function ($searchable) {
+            return is_string($searchable);
+        })->values()->whenEmpty(function () {
             $factory = new SearchableListFactory(app()->getNamespace(), app()->path());
 
             return $factory->make();
@@ -168,7 +174,7 @@ final class ImportCommand extends Command
             }
         }
 
-        $ttl = (int) config('elasticsearch.import.lock_ttl', self::DEFAULT_LOCK_TTL);
+        $ttl = $this->intConfig('elasticsearch.import.lock_ttl', self::DEFAULT_LOCK_TTL);
         $owner = (new ImportLock($source->searchableAs(), $ttl))->acquire();
 
         // Another import for this exact model is already running. Skip this one
@@ -245,19 +251,19 @@ final class ImportCommand extends Command
      */
     private function waitForRun(string $searchable, string $token, ?string $connection, ?string $queue): int
     {
-        $prepareKey = DispatchPullBatch::preparingKey($token);
+        $prepareKey = DispatchPullChunks::preparingKey($token);
         $start = microtime(true);
-        $appearTimeout = (int) config('elasticsearch.import.wait_timeout', self::DEFAULT_WAIT_TIMEOUT);
+        $appearTimeout = $this->intConfig('elasticsearch.import.wait_timeout', self::DEFAULT_WAIT_TIMEOUT);
         $store = app(ImportRunStore::class);
 
-        // Wait for the worker to run the prepare stages + DispatchPullBatch and
+        // Wait for the worker to run the prepare stages + DispatchPullChunks and
         // publish the run record. A worker first has to pick up the chain, clean
         // up + create the new index, and scan the primary keys to plan the
         // chunks before the run record exists.
         //
         // The timeout is applied to the time since the last *observed activity*,
         // not since dispatch: each prepare stage publishes a heartbeat as it
-        // begins (see StageJob::withHeartbeat + DispatchPullBatch), so a chain
+        // begins (see StageJob::withHeartbeat + DispatchPullChunks), so a chain
         // that is actively progressing keeps resetting the window and never
         // false-times-out just because a busy queue took a while to schedule
         // each hop. Two distinct give-up cases: never picked up (no heartbeat
@@ -270,9 +276,9 @@ final class ImportCommand extends Command
 
         while (($snapshot = $store->snapshot($token))['status'] === null) {
             $beat = Cache::get($prepareKey);
-            if ($beat !== null && ($beat['seq'] ?? null) !== $lastSeq) {
+            if (is_array($beat) && ($beat['seq'] ?? null) !== $lastSeq) {
                 $lastSeq = $beat['seq'] ?? null;
-                $lastStage = $beat['stage'] ?? null;
+                $lastStage = is_string($beat['stage'] ?? null) ? $beat['stage'] : null;
                 $lastActivity = microtime(true);
                 $pickedUp = true;
                 $this->comment(trans('scout::import.wait_preparing', [
@@ -429,14 +435,14 @@ final class ImportCommand extends Command
         $createIndex = (new StageJob(new CreateWriteIndex($source, $index)))
             ->withLockRenew($source->searchableAs(), $owner, $ttl);
 
-        $prepareKey = DispatchPullBatch::preparingKey($progressToken);
+        $prepareKey = DispatchPullChunks::preparingKey($progressToken);
         $cleanUp->withHeartbeat($prepareKey, 1, $ttl);
         $createIndex->withHeartbeat($prepareKey, 2, $ttl);
 
         $stages = [
             $cleanUp,
             $createIndex,
-            new DispatchPullBatch($source, $index, $connection, $queue, $owner, $ttl, $progressToken, $profile),
+            new DispatchPullChunks($source, $index, $connection, $queue, $owner, $ttl, $progressToken, $profile),
         ];
 
         foreach ($stages as $stage) {
@@ -452,5 +458,26 @@ final class ImportCommand extends Command
                 ImportLock::release($source->searchableAs(), $owner);
             })
             ->dispatch();
+    }
+
+    private function stringOption(string $key): ?string
+    {
+        $value = $this->option($key);
+
+        return is_string($value) && $value !== '' ? $value : null;
+    }
+
+    private function stringConfig(string $key): ?string
+    {
+        $value = config($key);
+
+        return is_string($value) && $value !== '' ? $value : null;
+    }
+
+    private function intConfig(string $key, int $default): int
+    {
+        $value = config($key, $default);
+
+        return is_numeric($value) ? (int) $value : $default;
     }
 }

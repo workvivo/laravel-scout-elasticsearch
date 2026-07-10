@@ -20,7 +20,7 @@ final class SkipIfImportRun
         $this->owner = $owner;
     }
 
-    public function handle($job, $next): void
+    public function handle(object $job, callable $next): void
     {
         $store = app(ImportRunStore::class);
         $status = $store->status($this->token);

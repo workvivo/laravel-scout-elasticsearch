@@ -26,7 +26,7 @@ use Matchish\ScoutElasticSearch\Searchable\ImportSource;
  *
  * @internal
  */
-final class DispatchPullBatch implements ShouldQueue
+final class DispatchPullChunks implements ShouldQueue
 {
     use Dispatchable;
     use InteractsWithQueue;
