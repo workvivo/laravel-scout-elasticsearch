@@ -146,7 +146,7 @@ final class ImportLockTest extends IntegrationTestCase
         Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
 
         $owner = (new ImportLock((new Product())->searchableAs(), 3600))->acquire();
-        $this->assertNotNull($owner, 'Import lock should be released after the parallel batch finishes');
+        $this->assertNotNull($owner, 'Import lock should be released after the parallel import finishes');
     }
 
     /**

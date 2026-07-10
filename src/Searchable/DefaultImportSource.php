@@ -92,8 +92,8 @@ final class DefaultImportSource implements ImportSource
         // Resolve the chunk size with clear precedence: the per-run --chunk
         // override, then a per-model config entry, then a package-wide default,
         // then Scout's global default (500). Fewer, larger chunks mean fewer
-        // batch completions and therefore less job_batches lock contention on
-        // large tables. Absent config keys reproduce today's behaviour exactly.
+        // queued jobs on large tables. Absent config keys reproduce today's
+        // behaviour exactly.
         // Guard against a misconfigured 0/negative value, which would make
         // limit($chunkSize) return nothing and silently import into an empty
         // index.

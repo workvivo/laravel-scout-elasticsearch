@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Tests\Unit\Jobs;
 
 use DateTimeInterface;
-use Illuminate\Queue\Middleware\SkipIfBatchCancelled;
 use Matchish\ScoutElasticSearch\ImportLock;
 use Matchish\ScoutElasticSearch\Jobs\StageJob;
 use Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface;
@@ -40,17 +39,6 @@ final class StageJobTest extends TestCase
                 $this->handled = true;
             }
         };
-    }
-
-    /**
-     * @test
-     */
-    public function it_registers_the_skip_if_batch_cancelled_middleware(): void
-    {
-        $middleware = (new StageJob($this->stubStage()))->middleware();
-
-        $this->assertCount(1, $middleware);
-        $this->assertInstanceOf(SkipIfBatchCancelled::class, $middleware[0]);
     }
 
     /**

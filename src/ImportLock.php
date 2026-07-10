@@ -49,7 +49,7 @@ final class ImportLock
 
     /**
      * Whether the given owner still holds the lease for this searchable. Lets a
-     * destructive stage (CleanUp, the batch rollback) confirm it is still the
+     * destructive stage (CleanUp, rollback) confirm it is still the
      * active run before deleting an index — if the lease has lapsed and been
      * re-acquired by another run, this returns false and the caller must not
      * delete an index that now belongs to someone else. Deliberately a predicate

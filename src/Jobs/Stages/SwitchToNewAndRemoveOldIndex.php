@@ -54,7 +54,7 @@ final class SwitchToNewAndRemoveOldIndex implements StageInterface
         // Confirm we still own the lease before the swap. This is check-then-act,
         // not atomic — a newer run could acquire between here and updateAliases —
         // but that window is a few milliseconds and the lease TTL remains the real
-        // backstop; the same shape guards CleanUp and the batch rollback.
+        // backstop; the same shape guards CleanUp and rollback.
         if ($this->owner !== null
             && ! ImportLock::isHeldBy($source->searchableAs(), $this->owner)) {
             logger()->warning('scout:import switch skipped: no longer lock owner', [

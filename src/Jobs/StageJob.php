@@ -2,12 +2,10 @@
 
 namespace Matchish\ScoutElasticSearch\Jobs;
 
-use Illuminate\Bus\Batchable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\Middleware\SkipIfBatchCancelled;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\ImportLock;
@@ -15,16 +13,13 @@ use Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface;
 use OpenSearch\Client;
 
 /**
- * Runs a single import stage as its own queued job so the pipeline can fan out
- * across workers (the `--parallel` path in
- * {@see \Matchish\ScoutElasticSearch\Console\Commands\ImportCommand}). Sequential
- * imports still run every stage in-process inside the Import job.
+ * Runs a single prepare stage as its own queued job in the `--parallel` path.
+ * Sequential imports still run every stage in-process inside the Import job.
  *
  * @internal
  */
 final class StageJob implements ShouldQueue
 {
-    use Batchable;
     use Dispatchable;
     use InteractsWithQueue;
     use Queueable;
@@ -61,15 +56,14 @@ final class StageJob implements ShouldQueue
     public int $heartbeatTtl = 3600;
 
     /**
-     * Renewable-lease carry for the prepare stages. Set (only on the CleanUp /
-     * CreateWriteIndex StageJobs in the --parallel chain) so the stage renews
+     * Renewable-lease carry for the prepare stages. Set on the CleanUp /
+     * CreateWriteIndex StageJobs in the --parallel chain so the stage renews
      * the {@see ImportLock} the instant a worker starts running it, keeping the
      * lease alive across the prepare window (clean up + create index + planning)
      * that would otherwise be entirely unrenewed between the command acquiring
      * the lock and {@see DispatchPullBatch} first renewing it. Deliberately
      * independent of {@see withHeartbeat} — the heartbeat only fires under
-     * --wait, but the lease must be renewed on every parallel run. Null = the
-     * chunk jobs, which rely on the batch progress() callback for renewal.
+     * --wait, but the lease must be renewed on every parallel run.
      *
      * @var string|null
      */
@@ -84,21 +78,10 @@ final class StageJob implements ShouldQueue
     public int $lockRenewTtl = 3600;
 
     /**
-     * Max attempts for this job. Defaults to 1 (today's behaviour: a chunk that
-     * throws fails immediately). Overridden per-instance on the fanned-out chunk
-     * jobs from `elasticsearch.import.batch.tries` so a transient failure (e.g. a
-     * job_batches lock-wait timeout raised in worker bookkeeping) can be retried
-     * against an idempotent re-index instead of cancelling the whole batch. Never
-     * raised on the prepare stages: {@see \Matchish\ScoutElasticSearch\Jobs\Stages\CreateWriteIndex}
-     * is non-idempotent and a retry would fail with resource_already_exists.
-     *
      * @var int
      */
     public int $tries = 1;
     /**
-     * Exponential-backoff base (seconds) for chunk-job retries. Null on the
-     * prepare stages, which never back off. See {@see backoff()}.
-     *
      * @var int|null
      */
     public ?int $backoffBase = null;
@@ -121,19 +104,6 @@ final class StageJob implements ShouldQueue
     public function __construct(StageInterface $stage)
     {
         $this->stage = $stage;
-    }
-
-    /**
-     * Skip this job when its batch has been cancelled (a sibling chunk already
-     * failed). Without this, once a failed chunk cancels the batch the remaining
-     * / retrying chunks keep fetching and bulk-indexing into an index the
-     * rollback is about to delete — the self-inflicted error storm. No-ops
-     * safely on the prepare stages, which are chained rather than batched, so
-     * `batch()` is null there.
-     */
-    public function middleware(): array
-    {
-        return [new SkipIfBatchCancelled];
     }
 
     /**
@@ -193,7 +163,8 @@ final class StageJob implements ShouldQueue
 
     /**
      * Make this stage publish a prepare-phase heartbeat when it begins, so
-     * {@see \Matchish\ScoutElasticSearch\Console\Commands\ImportCommand::waitForBatch}
+     * the waiting import command can distinguish "no worker has picked up the
+     * chain" from "a worker is actively preparing".
      * can distinguish "no worker has picked up the chain" from "a worker is
      * actively preparing".
      */
@@ -208,13 +179,6 @@ final class StageJob implements ShouldQueue
 
     public function handle(Client $elasticsearch): void
     {
-        // Recheck cancellation after the middleware admitted us: closes the
-        // admit->execute gap so a chunk that lost the race to a sibling's
-        // failure does no work. Cannot preempt a bulk already in progress.
-        if ($this->batch()?->cancelled()) {
-            return;
-        }
-
         if ($this->heartbeatKey !== null) {
             Cache::put($this->heartbeatKey, [
                 'seq' => $this->heartbeatSeq,

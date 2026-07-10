@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
 use Matchish\ScoutElasticSearch\Console\Commands\ImportCommand;
 use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
+use Matchish\ScoutElasticSearch\Jobs\PullChunkJob;
 use Matchish\ScoutElasticSearch\Jobs\StageJob;
 use stdClass;
 use Symfony\Component\Console\Output\BufferedOutput;
@@ -18,7 +19,7 @@ use Tests\IntegrationTestCase;
 final class ParallelImportCommandTest extends IntegrationTestCase
 {
     /**
-     * Route Scout imports through the sync connection. Sync executes batched
+     * Route Scout imports through the sync connection. Sync executes queued
      * jobs inline, so parallel imports run end-to-end in the test process — but
      * because it is the sync driver, --parallel needs --force to proceed.
      */
@@ -68,7 +69,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         $this->useSyncQueue();
 
         // Chunk size is 3 (see TestCase), so 10 rows fan out into 4 chunks that
-        // each run as their own batched job.
+        // each run as its own chunk job.
         $productsAmount = 10;
         $this->withoutModelEvents(Product::class, function () use ($productsAmount) {
             factory(Product::class, $productsAmount)->create();
@@ -114,7 +115,21 @@ final class ParallelImportCommandTest extends IntegrationTestCase
 
         $this->assertEquals(ImportCommand::FAILURE, $exitCode);
         Bus::assertNothingDispatched();
-        Bus::assertNothingBatched();
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_errors_when_the_import_lock_store_is_file(): void
+    {
+        Bus::fake();
+        $this->useAsyncDefaultQueue();
+        $this->app['config']->set('cache.default', 'file');
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+
+        $this->assertEquals(ImportCommand::FAILURE, $exitCode);
+        Bus::assertNothingDispatched();
     }
 
     /**
@@ -158,7 +173,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
     /**
      * @test
      */
-    public function chunk_option_changes_the_number_of_batched_jobs(): void
+    public function chunk_option_changes_the_number_of_chunk_jobs(): void
     {
         Bus::fake();
 
@@ -173,9 +188,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         // 10 rows, chunk size 10 => a single chunk (vs 4 at the config default 3).
         (new DispatchPullBatch($source, $index, 'redis', 'reindex', null))->handle();
 
-        Bus::assertBatched(function (\Illuminate\Bus\PendingBatch $batch) {
-            return $batch->jobs->count() === 1;
-        });
+        Bus::assertDispatched(PullChunkJob::class, 1);
     }
 
     /**
@@ -271,7 +284,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
      */
     public function wait_timeout_names_the_resolved_connection_and_queue(): void
     {
-        // Bus::fake() shelves the chain, so no prepare heartbeat and no batch
+        // Bus::fake() shelves the chain, so no prepare heartbeat and no run record
         // ever appear — the "never picked up" branch. wait_timeout=0 makes it
         // give up on the first poll.
         $this->useAsyncDefaultQueue();
@@ -304,9 +317,9 @@ final class ParallelImportCommandTest extends IntegrationTestCase
     public function wait_reports_a_stalled_prepare_when_the_chain_was_picked_up_then_went_silent(): void
     {
         // A heartbeat under the polled token means a worker picked up the chain;
-        // the batch never materialising after that is the "stalled prepare"
+        // the run record never materialising after that is the "stalled prepare"
         // case (slow stage, or crashed/OOM worker) — distinct from "no worker".
-        // waitForBatch is private and the command mints a random token, so drive
+        // waitForRun is private and the command mints a random token, so drive
         // it directly with a token whose heartbeat we seed.
         $this->app['config']->set('elasticsearch.import.wait_timeout', 0);
 
@@ -327,9 +340,9 @@ final class ParallelImportCommandTest extends IntegrationTestCase
             new \Illuminate\Console\OutputStyle(new \Symfony\Component\Console\Input\ArrayInput([]), $buffer)
         );
 
-        $waitForBatch = (new \ReflectionClass(ImportCommand::class))->getMethod('waitForBatch');
-        $waitForBatch->setAccessible(true);
-        $exit = $waitForBatch->invoke($command, 'App\Product', $token, 'redis', 'reindex');
+        $waitForRun = (new \ReflectionClass(ImportCommand::class))->getMethod('waitForRun');
+        $waitForRun->setAccessible(true);
+        $exit = $waitForRun->invoke($command, 'App\Product', $token, 'redis', 'reindex');
 
         $this->assertEquals(ImportCommand::SUCCESS, $exit);
         $text = $buffer->fetch();
@@ -337,7 +350,7 @@ final class ParallelImportCommandTest extends IntegrationTestCase
         // Reports the stalled case, names the stage it was last seen on, and
         // does NOT fall back to the "no worker picked it up" wording.
         $this->assertStringContainsString('Create write index', $text);
-        $this->assertStringContainsString('produced no batch', $text);
+        $this->assertStringContainsString('produced no run record', $text);
         $this->assertStringNotContainsString('no worker started', $text);
     }
 

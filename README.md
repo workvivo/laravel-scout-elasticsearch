@@ -201,11 +201,18 @@ chunks out across your queue workers with `--parallel`:
 php artisan scout:import "App\Models\Product" --parallel
 ```
 
-Each chunk (a keyset key-range, see below) becomes its own batched job, so many
+Each chunk (a keyset key-range, see below) becomes its own queued job, so many
 "pages" of the same model are pulled and indexed at once. The alias is only
 swapped to the new index once every chunk succeeds; if any chunk fails, the old
 index keeps serving, the failure is reported, and the half-filled new index is
 removed so it does not linger on the cluster.
+
+`--parallel` requires Redis for import coordination. Chunk completions are
+tracked in a Redis run record, and the per-model import lock still needs an
+atomic cache store; the file cache driver is not supported for parallel imports.
+Laravel may connect to Redis through either Predis or PhpRedis. This package's
+test suite uses Predis so the Redis coordinator tests do not require the PHP
+Redis extension.
 
 `--parallel` does **not** require `scout.queue` (that flag only governs per-model
 index syncs). It resolves its queue connection from `--connection`, then the
@@ -225,12 +232,8 @@ the command stops with an error. Pass `--force` to run it inline on `sync` anywa
 php artisan scout:import "App\Models\Product" --parallel --force
 ```
 
-`Bus::batch` needs the `job_batches` table (`php artisan queue:batches-table`
-then migrate) and the `queue.batching` config — the same requirement as any
-Laravel batch.
-
 By default `--parallel` dispatches and returns immediately (the work runs on your
-workers). Add `--wait` to block and watch a **chunk-based** progress bar, then get
+workers). Add `--wait` to block and watch chunk progress, then get
 a summary (documents indexed, chunk count, elapsed time; non-zero exit if any
 chunk failed):
 
@@ -238,7 +241,7 @@ chunk failed):
 php artisan scout:import "App\Models\Product" --parallel --wait
 ```
 
-`--wait` polls the batch, so it needs workers running to make progress. The
+`--wait` polls the Redis run record, so it needs workers running to make progress. The
 prepare chain (clean up → create index → plan chunks) publishes a heartbeat as
 each step runs, and `--wait` measures its timeout against the time since the
 **last observed step**, not since dispatch — so a chain that keeps progressing
@@ -277,17 +280,12 @@ effect is that some chunks may fetch fewer rows than their key-span suggests.
 
 ##### Running large parallel imports safely
 
-`--parallel` fans every chunk of a model into one `Bus::batch`. Laravel records
-each chunk's completion by locking that batch's row in `job_batches`
-(`SELECT … FOR UPDATE`), so the **more chunks finish at once, the more they
-contend on that single row** — and running many large imports together multiplies
-the load on that one table. Under enough contention MySQL raises
-`1205 Lock wait timeout`, which fails a chunk and cancels the whole model's batch.
-To keep a big reindex healthy:
+`--parallel` fans every chunk of a model into independent queue jobs coordinated
+by Redis. To keep a big reindex healthy:
 
-- **Fewer, larger chunks.** Each chunk that finishes is one `job_batches` update,
-  so raising the chunk size cuts contention proportionally. Set it per model
-  (keyed by `searchableAs()`) so small models keep the default:
+- **Fewer, larger chunks.** Raising the chunk size reduces planning work and the
+  number of queued jobs. Set it per model (keyed by `searchableAs()`) so small
+  models keep the default:
 
   ```php
   // config/elasticsearch.php → 'import'
@@ -300,11 +298,9 @@ To keep a big reindex healthy:
 
   Precedence is `--chunk` > per-model > `default` > `scout.chunk.searchable`.
 
-- **Bound the worker pool.** Contention scales with the number of workers
-  finishing chunks of the same batch at once. A handful of workers (≈4–8) on a
-  dedicated queue is plenty; pointing tens of workers at one batch is what tips it
-  over. Stagger models too — run the biggest ones one at a time (loop with
-  `--wait`) rather than launching them all together.
+- **Bound the worker pool.** A handful of workers on a dedicated queue is often
+  enough; very high concurrency can still overload the database or cluster even
+  though completion tracking is Redis-backed.
 
 - **Keep `retry_after` > `timeout`.** If a chunk runs longer than the queue
   connection's `retry_after` (or an SQS visibility timeout), the queue makes a
@@ -312,33 +308,29 @@ To keep a big reindex healthy:
   `MaxAttemptsExceeded`. Set the connection's `retry_after` comfortably above
   `elasticsearch.queue.timeout` (`SCOUT_QUEUE_TIMEOUT`).
 
-- **Opt-in chunk retries.** By default a chunk that throws fails immediately
-  (`tries=1`). If transient `job_batches` lock-waits are unavoidable at your
-  scale, let chunks retry with jittered exponential backoff instead of cancelling
-  the batch — the re-index is idempotent, so a retried chunk just overwrites:
+- **Chunk retries.** By default a chunk that throws fails immediately
+  (`tries=1`). For transient failures, let chunks retry with jittered exponential
+  backoff — the re-index is idempotent, so a retried chunk just overwrites:
 
   ```php
   // config/elasticsearch.php → 'import'
-  'batch' => [
-      'tries' => 3,           // SCOUT_IMPORT_BATCH_TRIES (1 = no retry)
-      'backoff_base' => 5,    // SCOUT_IMPORT_BATCH_BACKOFF_BASE, seconds
-      'backoff_cap' => 120,   // SCOUT_IMPORT_BATCH_BACKOFF_CAP, seconds
-      'retry_until' => 0,     // SCOUT_IMPORT_BATCH_RETRY_UNTIL (0 = tries only)
+  'retry' => [
+      'tries' => 3,           // SCOUT_IMPORT_RETRY_TRIES (1 = no retry)
+      'backoff_base' => 5,    // SCOUT_IMPORT_RETRY_BACKOFF_BASE, seconds
+      'backoff_cap' => 120,   // SCOUT_IMPORT_RETRY_BACKOFF_CAP, seconds
+      'retry_until' => 0,     // SCOUT_IMPORT_RETRY_UNTIL (0 = tries only)
   ],
   ```
 
-  `SCOUT_IMPORT_BATCH_TRIES=3` means each chunk can run three times total: the
-  first attempt plus two retries. Keep this bounded; it is for transient database
-  contention around Laravel's batch bookkeeping, not for retrying bad mappings or
-  permanently failing data.
-
-- Raising MySQL's `innodb_lock_wait_timeout` is a stopgap only — it lets a waiter
-  block longer before erroring, but it masks contention rather than removing it.
+  `SCOUT_IMPORT_RETRY_TRIES=3` means each chunk can run three times total: the
+  first attempt plus two retries. Keep this bounded; it is for transient
+  infrastructure failures, not for retrying bad mappings or permanently failing
+  data.
 
 A failed parallel import never swaps the alias and removes its half-built index,
 so re-running is safe — the live index keeps serving until a run fully succeeds.
-Once a batch is cancelled, remaining chunk jobs skip work before writing, and the
-rollback waits until the batch has settled before deleting the unpromoted index.
+Once a run fails, remaining chunk jobs skip work before writing, and rollback
+deletes the unpromoted index after a short drain delay.
 The destructive cleanup, rollback, and final alias swap all re-check the
 per-model lock owner first, so a stale run whose lease expired cannot delete or
 promote over a newer run's in-progress index.

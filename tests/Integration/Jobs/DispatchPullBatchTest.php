@@ -5,13 +5,14 @@ declare(strict_types=1);
 namespace Tests\Integration\Jobs;
 
 use App\Product;
-use Illuminate\Bus\PendingBatch;
 use Illuminate\Support\Facades\Bus;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
 use Matchish\ScoutElasticSearch\ImportLock;
 use Matchish\ScoutElasticSearch\Jobs\DispatchPullBatch;
+use Matchish\ScoutElasticSearch\Jobs\FinalizeJob;
+use Matchish\ScoutElasticSearch\Jobs\PullChunkJob;
+use Matchish\ScoutElasticSearch\Jobs\RollbackImportJob;
 use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
-use ReflectionMethod;
 use stdClass;
 use Tests\IntegrationTestCase;
 
@@ -33,7 +34,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
     /**
      * @test
      */
-    public function it_fans_out_one_batched_job_per_chunk_on_the_given_queue(): void
+    public function it_fans_out_one_chunk_job_per_chunk_on_the_given_queue(): void
     {
         Bus::fake();
 
@@ -46,36 +47,26 @@ final class DispatchPullBatchTest extends IntegrationTestCase
 
         (new DispatchPullBatch($source, $index, 'redis', 'reindex', 'owner-token', 900))->handle();
 
-        Bus::assertBatched(function (PendingBatch $batch) {
-            return $batch->jobs->count() === 4
-                && $batch->connection() === 'redis'
-                && $batch->queue() === 'reindex';
+        Bus::assertDispatched(PullChunkJob::class, 4);
+        Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
+            return $job->connection === 'redis' && $job->queue === 'reindex';
         });
     }
 
     /**
      * @test
      */
-    public function it_registers_progress_then_catch_and_finally_callbacks(): void
+    public function it_dispatches_finalize_for_an_empty_import(): void
     {
         Bus::fake();
-
-        $this->withoutModelEvents(Product::class, function () {
-            factory(Product::class, 6)->create();
-        });
 
         $source = $this->source();
         $index = Index::fromSource($source);
 
         (new DispatchPullBatch($source, $index, null, null, 'owner-token', 900))->handle();
 
-        Bus::assertBatched(function (PendingBatch $batch) {
-            // Heartbeat (renew), finalize, rollback, and lock release are all wired.
-            return count($batch->progressCallbacks()) === 1
-                && count($batch->thenCallbacks()) === 1
-                && count($batch->catchCallbacks()) === 1
-                && count($batch->finallyCallbacks()) === 1;
-        });
+        Bus::assertDispatched(FinalizeJob::class);
+        Bus::assertNotDispatched(PullChunkJob::class);
     }
 
     /**
@@ -96,7 +87,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
             'body' => ['settings' => ['number_of_shards' => 1, 'number_of_replicas' => 0]],
         ]);
 
-        DispatchPullBatch::removeUnpromotedIndex($source, $index);
+        RollbackImportJob::removeUnpromotedIndex($source, $index);
 
         $this->assertFalse(
             $this->elasticsearch->indices()->exists(['index' => $index->name()]),
@@ -117,7 +108,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $index = Index::fromSource($source);
 
         // Must not throw for an index that was never created.
-        DispatchPullBatch::removeUnpromotedIndex($source, $index);
+        RollbackImportJob::removeUnpromotedIndex($source, $index);
 
         $this->assertFalse($this->elasticsearch->indices()->exists(['index' => $index->name()]));
     }
@@ -135,7 +126,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $this->elasticsearch->indices()->create(['index' => 'orders_two']);
 
         // An Index whose name is a wildcard / foreign / empty value.
-        DispatchPullBatch::removeUnpromotedIndex($source, new Index($dangerousName));
+        RollbackImportJob::removeUnpromotedIndex($source, new Index($dangerousName));
 
         $this->assertTrue($this->elasticsearch->indices()->exists(['index' => 'products_one']));
         $this->assertTrue($this->elasticsearch->indices()->exists(['index' => 'orders_two']));
@@ -152,7 +143,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
 
         $owner = (new ImportLock($source->searchableAs(), 3600))->acquire();
 
-        DispatchPullBatch::removeUnpromotedIndex($source, $index, $owner);
+        RollbackImportJob::removeUnpromotedIndex($source, $index, $owner);
 
         $this->assertFalse(
             $this->elasticsearch->indices()->exists(['index' => $index->name()]),
@@ -172,7 +163,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         // Someone else now owns the lease for this model.
         (new ImportLock($source->searchableAs(), 3600))->acquire();
 
-        DispatchPullBatch::removeUnpromotedIndex($source, $index, 'stale-owner-token');
+        RollbackImportJob::removeUnpromotedIndex($source, $index, 'stale-owner-token');
 
         $this->assertTrue(
             $this->elasticsearch->indices()->exists(['index' => $index->name()]),
@@ -188,12 +179,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $source = $this->source();
         $index = Index::fromSource($source); // deliberately never created in ES
 
-        $finalize = new ReflectionMethod(DispatchPullBatch::class, 'finalize');
-        $finalize->setAccessible(true);
-
-        // A superseding run deleted the index before we could promote it: the
-        // refresh/swap must not throw a raw Missing404Exception.
-        $finalize->invoke(null, $source, $index);
+        (new FinalizeJob($source, $index, 'vanished-index-token'))->handle();
 
         $this->assertFalse($this->elasticsearch->indices()->exists(['index' => $index->name()]));
     }
@@ -215,9 +201,7 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         (new DispatchPullBatch($source, $index, null, null, 'owner-token', 900))->handle();
 
         // 10 rows / per-model chunk 5 => 2 chunks (the test config default is 3).
-        Bus::assertBatched(function (PendingBatch $batch) {
-            return $batch->jobs->count() === 2;
-        });
+        Bus::assertDispatched(PullChunkJob::class, 2);
     }
 
     /**
@@ -234,10 +218,8 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $source = $this->source();
         (new DispatchPullBatch($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
 
-        Bus::assertBatched(function (PendingBatch $batch) {
-            return $batch->jobs->every(function ($job) {
-                return $job->tries === 1 && $job->backoff() === [];
-            });
+        Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
+            return $job->tries === 1 && $job->backoff() === [];
         });
     }
 
@@ -247,9 +229,9 @@ final class DispatchPullBatchTest extends IntegrationTestCase
     public function chunk_jobs_carry_the_configured_retry_settings(): void
     {
         Bus::fake();
-        $this->app['config']->set('elasticsearch.import.batch.tries', 7);
-        $this->app['config']->set('elasticsearch.import.batch.backoff_base', 3);
-        $this->app['config']->set('elasticsearch.import.batch.backoff_cap', 30);
+        $this->app['config']->set('elasticsearch.import.retry.tries', 7);
+        $this->app['config']->set('elasticsearch.import.retry.backoff_base', 3);
+        $this->app['config']->set('elasticsearch.import.retry.backoff_cap', 30);
 
         $this->withoutModelEvents(Product::class, function () {
             factory(Product::class, 6)->create();
@@ -258,10 +240,8 @@ final class DispatchPullBatchTest extends IntegrationTestCase
         $source = $this->source();
         (new DispatchPullBatch($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
 
-        Bus::assertBatched(function (PendingBatch $batch) {
-            return $batch->jobs->every(function ($job) {
-                return $job->tries === 7 && $job->backoffBase === 3 && $job->backoffCap === 30;
-            });
+        Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
+            return $job->tries === 7 && $job->backoffBase === 3 && $job->backoffCap === 30;
         });
     }
 

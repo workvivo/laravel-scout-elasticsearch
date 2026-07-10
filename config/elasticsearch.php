@@ -18,34 +18,32 @@ return [
         // index. Requires a cache store with atomic add (redis, memcached,
         // database, dynamodb) — the file driver is unsuitable.
         'lock_ttl' => (int) env('SCOUT_IMPORT_LOCK_TTL', 3600),
-        // Seconds `scout:import --parallel --wait` polls for the batch to be
-        // created before giving up and leaving the work queued (e.g. when no
+        // Seconds `scout:import --parallel --wait` polls for the run record to
+        // be created before giving up and leaving the work queued (e.g. when no
         // worker is running to pick it up).
         'wait_timeout' => (int) env('SCOUT_IMPORT_WAIT_TIMEOUT', 120),
 
-        // Opt-in retry for the fanned-out chunk jobs of a --parallel import.
+        // Retry for the fanned-out chunk jobs of a --parallel import.
         // Defaults reproduce today's behaviour: tries=1 means a chunk that
-        // throws fails immediately. Raising tries lets a transient failure —
-        // most importantly a MySQL 1205 "Lock wait timeout" on the job_batches
-        // bookkeeping row under heavy parallel fan-out — be retried with
-        // exponential, jittered backoff instead of cancelling the whole model's
-        // batch. Safe because the chunk re-index is idempotent (stable document
-        // ids overwrite). Applies to chunk jobs only; the prepare stages never
+        // throws fails immediately. Raising tries lets a transient failure be
+        // retried with exponential, jittered backoff. Safe because the chunk
+        // re-index is idempotent (stable document ids overwrite). Applies to
+        // chunk jobs only; the prepare stages never
         // retry. IMPORTANT: keep the queue connection's retry_after (or SQS
         // visibility timeout) greater than `queue.timeout` above, or the queue
         // will re-run a still-running chunk and trip MaxAttemptsExceeded.
-        'batch' => [
-            'tries' => (int) env('SCOUT_IMPORT_BATCH_TRIES', 1),
-            'backoff_base' => (int) env('SCOUT_IMPORT_BATCH_BACKOFF_BASE', 5),
-            'backoff_cap' => (int) env('SCOUT_IMPORT_BATCH_BACKOFF_CAP', 120),
+        'retry' => [
+            'tries' => (int) env('SCOUT_IMPORT_RETRY_TRIES', env('SCOUT_IMPORT_BATCH_TRIES', 1)),
+            'backoff_base' => (int) env('SCOUT_IMPORT_RETRY_BACKOFF_BASE', env('SCOUT_IMPORT_BATCH_BACKOFF_BASE', 5)),
+            'backoff_cap' => (int) env('SCOUT_IMPORT_RETRY_BACKOFF_CAP', env('SCOUT_IMPORT_BATCH_BACKOFF_CAP', 120)),
             // Optional wall-clock ceiling per chunk, in seconds (0 = bounded by
             // tries only).
-            'retry_until' => (int) env('SCOUT_IMPORT_BATCH_RETRY_UNTIL', 0),
+            'retry_until' => (int) env('SCOUT_IMPORT_RETRY_UNTIL', env('SCOUT_IMPORT_BATCH_RETRY_UNTIL', 0)),
         ],
+        'rollback_delay' => (int) env('SCOUT_IMPORT_ROLLBACK_DELAY', 5),
 
         // Per-model chunk size for imports, keyed by the model's searchableAs().
-        // Fewer, larger chunks = fewer batch completions = less job_batches lock
-        // contention on large tables. Precedence: the --chunk option, then the
+        // Fewer, larger chunks = fewer queued jobs. Precedence: the --chunk option, then the
         // per-model entry here, then 'default', then scout.chunk.searchable (500).
         // Absent keys change nothing. Example:
         //   'chunk' => ['default' => null, 'products' => 2000, 'orders' => 5000],

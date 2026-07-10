@@ -8,9 +8,11 @@ use Illuminate\Support\Facades\Artisan;
 use Laravel\Scout\ScoutServiceProvider;
 use Matchish\ScoutElasticSearch\ElasticSearchServiceProvider;
 use Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine;
+use Matchish\ScoutElasticSearch\Import\ImportRunStore;
 use Matchish\ScoutElasticSearch\ScoutElasticSearchServiceProvider;
 use OpenSearch\Client;
 use Orchestra\Testbench\TestCase as BaseTestCase;
+use Tests\Fakes\FakeImportRunStore;
 
 abstract class TestCase extends BaseTestCase
 {
@@ -33,6 +35,7 @@ abstract class TestCase extends BaseTestCase
         parent::setUp();
 
         $this->app->setBasePath(__DIR__.'/laravel');
+        $this->app->singleton(ImportRunStore::class, FakeImportRunStore::class);
 
         $this->withFactories(database_path('factories'));
 
