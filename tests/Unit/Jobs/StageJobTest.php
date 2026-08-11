@@ -47,10 +47,12 @@ final class StageJobTest extends TestCase
     public function backoff_is_empty_for_a_prepare_stage(): void
     {
         // No backoff base (prepare stages), tries stays 1: nothing to retry.
+        // null, not []: an empty array is imploded to '' in the payload and read
+        // back as (int) 0, i.e. an immediate re-release with no delay at all.
         $job = new StageJob($this->stubStage());
 
         $this->assertSame(1, $job->tries);
-        $this->assertSame([], $job->backoff());
+        $this->assertNull($job->backoff());
     }
 
     /**
@@ -63,7 +65,7 @@ final class StageJobTest extends TestCase
         $job->backoffCap = 120;
         $job->tries = 1;
 
-        $this->assertSame([], $job->backoff());
+        $this->assertNull($job->backoff());
     }
 
     /**

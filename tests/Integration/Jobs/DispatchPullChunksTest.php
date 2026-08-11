@@ -284,8 +284,11 @@ final class DispatchPullChunksTest extends IntegrationTestCase
         $source = $this->source();
         (new DispatchPullChunks($source, Index::fromSource($source), null, null, 'owner-token', 900))->handle();
 
+        // backoff() is null rather than [] at a single try: an empty array is
+        // imploded to '' in the queue payload and read back as (int) 0, which
+        // would release a failed chunk immediately instead of not at all.
         Bus::assertDispatched(PullChunkJob::class, function (PullChunkJob $job) {
-            return $job->tries === 1 && $job->backoff() === [];
+            return $job->tries === 1 && $job->backoff() === null;
         });
     }
 

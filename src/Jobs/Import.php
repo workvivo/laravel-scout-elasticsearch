@@ -48,6 +48,15 @@ final class Import
      */
     private $profile;
 
+    /**
+     * Target number of chunks to profile, spread across the whole plan, instead
+     * of profiling every one. Null (the default) keeps $profile meaning "every
+     * chunk".
+     *
+     * @var int|null
+     */
+    private $profileSamples;
+
     public ?int $timeout = null;
 
     /**
@@ -55,13 +64,15 @@ final class Import
      * @param  string|null  $lockOwner
      * @param  int  $lockTtl
      * @param  bool  $profile
+     * @param  int|null  $profileSamples
      */
-    public function __construct(ImportSource $source, ?string $lockOwner = null, int $lockTtl = 3600, bool $profile = false)
+    public function __construct(ImportSource $source, ?string $lockOwner = null, int $lockTtl = 3600, bool $profile = false, ?int $profileSamples = null)
     {
         $this->source = $source;
         $this->lockOwner = $lockOwner;
         $this->lockTtl = $lockTtl;
         $this->profile = $profile;
+        $this->profileSamples = $profileSamples;
     }
 
     /**
@@ -102,6 +113,6 @@ final class Import
      */
     private function stages(): Collection
     {
-        return ImportStages::fromSource($this->source, $this->profile, $this->lockOwner);
+        return ImportStages::fromSource($this->source, $this->profile, $this->lockOwner, $this->profileSamples);
     }
 }

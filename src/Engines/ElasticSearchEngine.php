@@ -43,13 +43,106 @@ final class ElasticSearchEngine extends Engine
      */
     public function update($models)
     {
+        $this->performUpdate($models, null);
+    }
+
+    /**
+     * Index the models into an explicit index instead of the alias
+     * `searchableAs()` resolves to.
+     *
+     * A sibling of {@see update} rather than an extra argument on it: update()
+     * implements Scout's Engine contract, so its signature is not ours to widen.
+     * Callers that need the redirection (--probe writing to a throwaway index it
+     * will delete, which must never become the alias's write index) ask for it by
+     * name; everyone else keeps the contract method and the alias.
+     *
+     * @param  \Illuminate\Database\Eloquent\Collection|iterable  $models
+     * @param  string  $index
+     * @return void
+     */
+    public function updateInto($models, string $index)
+    {
+        $this->performUpdate($models, $index);
+    }
+
+    /**
+     * The one body {@see update} and {@see updateInto} share, so the error triage
+     * can never drift between the two entry points.
+     *
+     * @param  \Illuminate\Database\Eloquent\Collection|iterable  $models
+     * @param  string|null  $index  null = each model's own searchableAs()
+     * @return void
+     */
+    private function performUpdate($models, ?string $index)
+    {
         $params = new Bulk();
+        $params->into($index);
         $params->index($models);
         $response = $this->elasticsearch->bulk($params->toArray());
         if (array_key_exists('errors', $response) && $response['errors']) {
+            // The raw response stays on the previous exception (nothing is lost),
+            // but it can be megabytes of successful items and never says WHICH
+            // document was rejected. Name the offending ids in the message so a
+            // log line is actionable on its own.
             $error = new ServerErrorResponseException(json_encode($response, JSON_PRETTY_PRINT));
-            throw new \Exception('Bulk update error', $error->getCode(), $error);
+            throw new \Exception($this->bulkErrorMessage($response), $error->getCode(), $error);
         }
+    }
+
+    /**
+     * Summarise the failing items of a bulk response as "id: type: reason".
+     *
+     * A bulk response reports one item per action, each keyed by the action
+     * name (index/create/update/delete), and only the failing ones carry an
+     * `error` member. The list is capped so a batch where every document fails
+     * cannot produce an unbounded exception message.
+     *
+     * @param  array  $response
+     * @return string
+     */
+    private function bulkErrorMessage($response): string
+    {
+        $cap = 10;
+        $failures = [];
+        $total = 0;
+
+        foreach ($response['items'] ?? [] as $item) {
+            if (! is_array($item)) {
+                continue;
+            }
+            // Each item is a single-element map: ['index' => [...]].
+            $result = reset($item);
+            if (! is_array($result) || ! isset($result['error'])) {
+                continue;
+            }
+
+            $total++;
+            if (count($failures) >= $cap) {
+                continue;
+            }
+
+            $error = is_array($result['error']) ? $result['error'] : ['reason' => (string) $result['error']];
+            $failures[] = implode(': ', array_filter([
+                isset($result['_id']) ? (string) $result['_id'] : '?',
+                $error['type'] ?? null,
+                $error['reason'] ?? null,
+            ]));
+        }
+
+        if (0 === $total) {
+            // `errors: true` with no per-item error is not expected; fall back
+            // to the historic message rather than claiming zero failures.
+            return 'Bulk update error';
+        }
+
+        $message = 'Bulk update error: '.$total.' of '.count($response['items'] ?? []).' items failed: '
+            .implode('; ', $failures);
+
+        if ($total > count($failures)) {
+            $message .= ' (+'.($total - count($failures)).' more)';
+        }
+
+        return $message;
     }
 
     /**

@@ -20,14 +20,19 @@ class ImportStages extends Collection
      * @param  ImportSource  $source
      * @param  bool  $profile
      * @param  string|null  $owner
+     * @param  int|null  $profileSamples  profile roughly this many chunks, spread
+     *                                    across the plan, instead of every one
      * @return Collection<int, \Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface>
      */
-    public static function fromSource(ImportSource $source, bool $profile = false, ?string $owner = null)
+    public static function fromSource(ImportSource $source, bool $profile = false, ?string $owner = null, ?int $profileSamples = null)
     {
         $index = Index::fromSource($source);
 
+        // Sampling matters just as much here as on the --parallel path: a
+        // sequential import of the same table has the identical chunk count, so
+        // profiling every chunk floods the log exactly the same way.
         /** @var array<int, \Matchish\ScoutElasticSearch\Jobs\Stages\StageInterface> $pullStages */
-        $pullStages = PullFromSource::chunked($source, $profile)->all();
+        $pullStages = PullFromSource::chunked($source, $profile, $profileSamples)->all();
 
         return new self(array_merge([
             new CleanUp($source, $owner),

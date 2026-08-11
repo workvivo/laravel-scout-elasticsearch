@@ -58,19 +58,19 @@ install: up ## Install application dependencies into application container
 	$(docker_compose_bin) exec $(DOCKER_EXEC_USER_FLAG) "$(APP_CONTAINER_NAME)" composer install --no-interaction --ansi
 
 test: up ## Execute application tests
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --testdox --stop-on-failure'
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off php -d memory_limit=512M ./vendor/bin/phpunit --testdox --stop-on-failure'
 
 analyse: up ## Execute static analysis
 	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpstan analyze --memory-limit=4000M'
 
 test-coverage: up ## Execute application tests and generate report
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=coverage ./vendor/bin/phpunit --coverage-html build/coverage-report'
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=coverage php -d memory_limit=512M ./vendor/bin/phpunit --coverage-html build/coverage-report'
 
 test-filter:
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit --filter=$(filter) --testdox'
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off php -d memory_limit=512M ./vendor/bin/phpunit --filter=$(filter) --testdox'
 
 test-unit:
-	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure'
+	$(docker_compose_bin) exec "$(APP_CONTAINER_NAME)" sh -lc 'XDEBUG_MODE=off php -d memory_limit=512M ./vendor/bin/phpunit $(filter-out $@,$(MAKECMDGOALS)) --testdox --stop-on-failure'
 
 test-local: ## Run tests locally without docker (requires native mysql + opensearch + redis)
-	XDEBUG_MODE=off ./vendor/bin/phpunit --testdox
+	XDEBUG_MODE=off php -d memory_limit=512M ./vendor/bin/phpunit --testdox

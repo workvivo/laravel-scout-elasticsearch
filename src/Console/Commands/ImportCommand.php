@@ -8,10 +8,13 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Lang;
 use Illuminate\Support\Str;
 use Matchish\ScoutElasticSearch\ElasticSearch\Config\Config;
 use Matchish\ScoutElasticSearch\ElasticSearch\Index;
+use Matchish\ScoutElasticSearch\Import\ImportProbe;
 use Matchish\ScoutElasticSearch\Import\ImportRunStore;
+use Matchish\ScoutElasticSearch\Import\QueueTimingPreflight;
 use Matchish\ScoutElasticSearch\ImportLock;
 use Matchish\ScoutElasticSearch\Jobs\DispatchPullChunks;
 use Matchish\ScoutElasticSearch\Jobs\Import;
@@ -26,6 +29,10 @@ use Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory;
 use Matchish\ScoutElasticSearch\Searchable\SearchableListFactory;
 use OpenSearch\Client;
 
+/**
+ * @phpstan-import-type Report from \Matchish\ScoutElasticSearch\Import\QueueTimingPreflight
+ * @phpstan-import-type ProbeReport from \Matchish\ScoutElasticSearch\Import\ImportProbe
+ */
 final class ImportCommand extends Command
 {
     const DEFAULT_LOCK_TTL = 3600;
@@ -37,6 +44,60 @@ final class ImportCommand extends Command
     const DEFAULT_WAIT_TIMEOUT = 120;
 
     /**
+     * Cap on distinct profiling findings assumed when the config key is absent,
+     * kept in step with config/elasticsearch.php and with PullChunkJob. Only used
+     * to decide whether findings can exist at all: 0 there means the workers
+     * publish nothing, so --wait has nothing to poll for.
+     */
+    const DEFAULT_PROFILE_FINDINGS = 20;
+
+    /**
+     * The sample target `--profile-samples=all` resolves to.
+     *
+     * Profiling every chunk is not a separate mode, it is the degenerate case of
+     * sampling: PullFromSource::profileStride() turns a target into a stride with
+     * max(1, intdiv($total, $samples)), so any target at or above the chunk count
+     * already collapses to a stride of 1, i.e. every chunk. Asking for
+     * PHP_INT_MAX samples is therefore "profile every chunk" expressed in the one
+     * vocabulary the jobs already speak — no extra flag, no branch in the stride
+     * math, and the same value on every continuation hop and in the reaper.
+     */
+    const PROFILE_SAMPLES_ALL = PHP_INT_MAX;
+
+    /**
+     * Chunks --probe measures when --probe-samples is absent or unusable. Three
+     * is enough to see a spread (and so to judge whether the mean means
+     * anything) while still finishing in seconds on a table with millions of
+     * rows, which is the entire point of the flag.
+     */
+    const DEFAULT_PROBE_SAMPLES = 3;
+
+    /**
+     * Workers the --probe estimate is divided across when --probe-workers is
+     * absent or unusable. One, i.e. the serial estimate, because that is the
+     * only figure the probe can defend without being told how the fan-out will
+     * be staffed.
+     */
+    const DEFAULT_PROBE_WORKERS = 1;
+
+    /**
+     * Every placeholder the profile-finding messages may name.
+     *
+     * A finding's numbers are read back out of the run record, where they were
+     * left as free-form JSON by a worker process — possibly running a different
+     * release of this package. Seeding all of them with "?" means a key that never
+     * arrived degrades to a "?" in the sentence instead of leaving a literal
+     * ":loads" in front of the operator.
+     */
+    const PROFILE_FINDING_PLACEHOLDERS = [
+        'relation', 'loads', 'relations',
+        'total_ms', 'timeout', 'pct',
+        'queries', 'fetched',
+        'fetch_ms', 'index_ms', 'bulk_ms',
+        'avg_kb', 'payload_kb', 'indexed',
+    ];
+
+    /**
      * @inheritdoc
      */
     protected $signature = 'scout:import {searchable?* : The name of the searchable}
@@ -45,9 +106,13 @@ final class ImportCommand extends Command
         {--connection= : Queue connection the import jobs run on (defaults to scout.queue, then the app default queue)}
         {--force : Run --parallel even when the resolved queue connection is synchronous}
         {--wait : With --parallel, block and show chunk progress until the import finishes}
+        {--preflight : With --parallel, report the queue timing pre-flight and exit without importing anything}
         {--chunk= : Rows per chunk for this run (overrides the scout.chunk.searchable config)}
         {--fast-plan : Plan chunk boundaries from bare keys, skipping the eager-load join/filters (faster on joined models)}
-        {--profile : Log a per-chunk fetch/filter/index timing breakdown to help diagnose slow chunks}';
+        {--profile-samples= : Profile roughly this many chunks, spread across the plan, or "all" for every chunk}
+        {--probe : Measure a small sample of chunks against a throwaway index, report the findings, and exit without importing}
+        {--probe-samples= : How many chunks --probe measures, spread across the plan (default 3)}
+        {--probe-workers= : Divide the --probe time estimate across this many workers (default 1)}';
     /**
      * @inheritdoc
      */
@@ -58,12 +123,23 @@ final class ImportCommand extends Command
      */
     public function handle(): int
     {
+        // --probe measures a few chunks in-process and exits: it dispatches
+        // nothing, so nothing about the queue can be relevant to it. Every
+        // --parallel gate below (Redis coordination, an atomic lock store, an
+        // asynchronous connection, the queue timing pre-flight) asks whether
+        // this host could run a fan-out — and none of those answers may stand
+        // between an operator and a diagnosis that never touches a queue. So
+        // while probing, --parallel is simply ignored rather than gated: the
+        // probe is useful for a sequential import too, which is also why it does
+        // not require --parallel and does not complain about its absence.
+        $probing = (bool) $this->option('probe');
+
         // --parallel fans chunks out onto a queue, so it only does real work on
         // an asynchronous connection. It does NOT require scout.queue (that flag
         // only governs per-model index syncs): the connection is resolved from
         // --connection, then scout.queue, then the app's default queue. Bail
         // early if that resolves to the sync driver, unless --force is given.
-        if ($this->option('parallel')) {
+        if ($this->option('parallel') && ! $probing) {
             if (! app(ImportRunStore::class)->supportsAtomicCoordination()) {
                 $this->error(trans('scout::import.parallel_requires_redis'));
 
@@ -75,9 +151,20 @@ final class ImportCommand extends Command
 
                 return self::FAILURE;
             }
+
+            // Queue timing: a chunk has to survive its own re-delivery window,
+            // or the broker hands a second copy to another worker while the
+            // first is still working — on SQS that copy arrives already looking
+            // exhausted and is failed before the job body runs. Only proven
+            // (probed) misordering aborts; everything else warns. --preflight
+            // stops here either way, having planned and dispatched nothing.
+            $preflight = $this->queueTimingPreflight();
+            if ($preflight !== null) {
+                return $preflight;
+            }
         }
 
-        if ($this->option('parallel') && ! $this->option('force')) {
+        if ($this->option('parallel') && ! $probing && ! $this->option('force')) {
             $connection = $this->resolvedConnection();
 
             if ($this->isSyncConnection($connection)) {
@@ -95,8 +182,34 @@ final class ImportCommand extends Command
             return self::FAILURE;
         }
 
+        // Unlike --chunk this warns and carries on: --profile-samples only picks
+        // which chunks get a diagnostic log line, and a mistyped diagnostic knob
+        // must never be able to block an import. An unusable value reads as "no
+        // sample target", and since the target is now the only way to ask for
+        // profiling, that means this run is simply not profiled.
+        if ($this->option('profile-samples') !== null && $this->profileSamplesOption() === null) {
+            $this->warn(trans('scout::import.invalid_profile_samples'));
+        }
+
+        // Same rule for both --probe knobs, and for the same reason: a mistyped
+        // number on a DIAGNOSTIC must never abort. Each falls back to its
+        // default and says so, because a probe that silently measured a
+        // different number of chunks than was asked for is worse than one that
+        // measured the default and admitted it.
+        if ($this->option('probe-samples') !== null && $this->probeSamplesOption() === null) {
+            $this->warn(trans('scout::import.invalid_probe_samples', ['default' => self::DEFAULT_PROBE_SAMPLES]));
+        }
+
+        if ($this->option('probe-workers') !== null && $this->probeWorkersOption() === null) {
+            $this->warn(trans('scout::import.invalid_probe_workers', ['default' => self::DEFAULT_PROBE_WORKERS]));
+        }
+
         if ($this->option('wait') && ! $this->option('parallel')) {
             $this->warn(trans('scout::import.wait_needs_parallel'));
+        }
+
+        if ($this->option('preflight') && ! $this->option('parallel')) {
+            $this->warn(trans('scout::import.preflight_needs_parallel'));
         }
 
         $failed = false;
@@ -143,6 +256,192 @@ final class ImportCommand extends Command
     }
 
     /**
+     * Report the queue timing pre-flight for a --parallel run.
+     *
+     * Returns an exit code when the command must stop here — a proven fatal
+     * misordering, or a --preflight dry run, which always stops before a lock is
+     * taken or a job is dispatched — and null when the import should carry on.
+     */
+    private function queueTimingPreflight(): ?int
+    {
+        $dryRun = (bool) $this->option('preflight');
+        $force = (bool) $this->option('force');
+
+        // --force already waives the sync-connection abort, so it waives this
+        // check too — but never silently: a forced run says out loud that the
+        // re-delivery ordering went unverified. --preflight is a request for the
+        // report itself, so it still runs and only downgrades its fatals.
+        if ($force && ! $dryRun) {
+            $this->warn(trans('scout::import.preflight_skipped_forced'));
+
+            return null;
+        }
+
+        // Master switch off: stay silent on a real run. A --preflight dry run
+        // still prints the settings table, saying the check itself is disabled,
+        // because being asked for the report is not the same as being checked.
+        if (! QueueTimingPreflight::isEnabled() && ! $dryRun) {
+            return null;
+        }
+
+        $connection = $this->resolvedConnection();
+        $queue = $this->resolvedQueue();
+
+        // Resolved from the container (its probe seam defaults to the real
+        // read-only GetQueueAttributes call) so a test can bind a fake probe and
+        // never touch AWS.
+        $report = app(QueueTimingPreflight::class)->inspect($connection, $queue, $this->chunkOption());
+
+        $forced = false;
+        if ($force && QueueTimingPreflight::hasFatal($report)) {
+            $report = QueueTimingPreflight::withoutFatals($report);
+            $forced = true;
+        }
+
+        // The 21-row fact table is REFERENCE material: it exists so an operator
+        // auditing their queue timing can see every number and whether it was
+        // probed, declared or merely assumed. That is what --preflight is for, so
+        // that is the only place it prints. A real import prints the findings and
+        // nothing else — they are the actionable part, and burying two warnings
+        // under a full-screen table before every single run trains people to
+        // scroll past both. --preflight is one keystroke away when the numbers
+        // behind a warning are wanted.
+        if ($dryRun) {
+            $this->renderPreflightReport($report);
+        }
+
+        $this->renderPreflightFindings($report);
+
+        if ($forced) {
+            $this->warn(trans('scout::import.preflight_forced'));
+        }
+
+        if ($report['fatal']) {
+            $this->error(trans('scout::import.preflight_abort'));
+
+            return self::FAILURE;
+        }
+
+        if ($dryRun && $report['enabled'] && $report['findings'] === []) {
+            $this->line(trans('scout::import.preflight_ok'));
+        }
+
+        return $dryRun ? self::SUCCESS : null;
+    }
+
+    /**
+     * Print the reference half of the pre-flight: the header, and the INFO facts
+     * as a table with a provenance marker on every row so an operator can tell a
+     * probed fact from an assumed one. --preflight only; see the call site.
+     *
+     * @param  Report  $report
+     */
+    private function renderPreflightReport(array $report): void
+    {
+        $this->line(trans('scout::import.preflight_header', [
+            'connection' => $report['connection'] ?? '(default)',
+            'queue' => $report['probe']['queue_url']
+                ?? $report['queue']
+                ?? trans('scout::import.preflight_value_driver_default'),
+        ]));
+
+        if (! $report['enabled']) {
+            $this->warn(trans('scout::import.preflight_disabled'));
+        }
+
+        $rows = [];
+        foreach ($report['facts'] as $fact) {
+            $rows[] = [$fact['label'], $fact['value'], $fact['provenance_label']];
+        }
+
+        $this->table([
+            trans('scout::import.preflight_table_fact'),
+            trans('scout::import.preflight_table_value'),
+            trans('scout::import.preflight_table_provenance'),
+        ], $rows);
+
+        $this->line(trans('scout::import.preflight_hint'));
+    }
+
+    /**
+     * Print the actionable half: warnings via warn(), proven fatals via error().
+     * Printed on every --parallel run, not just a dry one — a finding is the
+     * reason this check exists, and a run that is about to be re-delivered
+     * mid-flight should say so whether or not anyone asked for the table.
+     *
+     * @param  Report  $report
+     */
+    private function renderPreflightFindings(array $report): void
+    {
+        foreach ($report['findings'] as $finding) {
+            if ($finding['severity'] === QueueTimingPreflight::SEVERITY_FATAL) {
+                $this->error($finding['message']);
+            } else {
+                $this->warn($finding['message']);
+            }
+        }
+    }
+
+    /**
+     * The run's chunk size when --chunk names a usable one, so the pre-flight
+     * can report it as declared rather than guessing from config.
+     */
+    private function chunkOption(): ?int
+    {
+        $chunk = $this->option('chunk');
+
+        return is_numeric($chunk) && (int) $chunk > 0 ? (int) $chunk : null;
+    }
+
+    /**
+     * The --profile-samples target when it names a usable one: how many chunks to
+     * profile, spread across the whole plan.
+     *
+     * This is the ONLY switch that turns profiling on — a usable target here is
+     * exactly what the `bool $profile` the jobs carry is derived from. A zero,
+     * negative, empty or non-numeric value reads as "not provided", which leaves
+     * the run unprofiled (handle() warns and carries on; a diagnostic knob never
+     * aborts an import).
+     */
+    private function profileSamplesOption(): ?int
+    {
+        $samples = $this->option('profile-samples');
+
+        // "all" is not a special mode, just the largest possible target: a target
+        // above the chunk count degrades to a stride of 1 in
+        // PullFromSource::profileStride(), i.e. every chunk. Case-insensitive and
+        // trimmed because this is typed by hand on a terminal.
+        if (is_string($samples) && strtolower(trim($samples)) === 'all') {
+            return self::PROFILE_SAMPLES_ALL;
+        }
+
+        return is_numeric($samples) && (int) $samples > 0 ? (int) $samples : null;
+    }
+
+    /**
+     * How many chunks --probe should measure, or null when --probe-samples names
+     * no usable count (handle() warns and {@see DEFAULT_PROBE_SAMPLES} applies).
+     */
+    private function probeSamplesOption(): ?int
+    {
+        $samples = $this->option('probe-samples');
+
+        return is_numeric($samples) && (int) $samples > 0 ? (int) $samples : null;
+    }
+
+    /**
+     * How many workers the --probe estimate is divided across, or null when
+     * --probe-workers names no usable count (handle() warns and
+     * {@see DEFAULT_PROBE_WORKERS} applies).
+     */
+    private function probeWorkersOption(): ?int
+    {
+        $workers = $this->option('probe-workers');
+
+        return is_numeric($workers) && (int) $workers > 0 ? (int) $workers : null;
+    }
+
+    /**
      * @param  array<int, mixed>  $argument
      * @return Collection<int, string>
      */
@@ -174,6 +473,16 @@ final class ImportCommand extends Command
             }
         }
 
+        // --probe measures a handful of chunks and exits. It sits HERE, and not
+        // in handle(), for two reasons: --chunk and --fast-plan have just been
+        // applied to the source, so the probe measures the shape the real import
+        // would use; and it returns before the lease is acquired, because a
+        // probe is non-destructive and must neither block a real import nor be
+        // blocked by one (it reports a lease it finds held as a warning instead).
+        if ($this->option('probe')) {
+            return $this->probe($source, $searchable);
+        }
+
         $ttl = $this->intConfig('elasticsearch.import.lock_ttl', self::DEFAULT_LOCK_TTL);
         $owner = (new ImportLock($source->searchableAs(), $ttl))->acquire();
 
@@ -195,6 +504,12 @@ final class ImportCommand extends Command
         // release here if dispatch itself failed before that handoff.
         $handedOff = false;
 
+        // Resolved ONCE, because the jobs carry the sample target and a plain
+        // "is this run profiled?" bool side by side, and the two must not be able
+        // to disagree: profiling is on precisely when a usable target exists.
+        $profileSamples = $this->profileSamplesOption();
+        $profile = $profileSamples !== null;
+
         try {
             $startMessage = trans('scout::import.start', ['searchable' => "<comment>$searchable</comment>"]);
             $this->line($startMessage);
@@ -203,7 +518,7 @@ final class ImportCommand extends Command
                 $connection = $this->resolvedConnection();
                 $queue = $this->resolvedQueue();
                 $token = (string) Str::uuid();
-                $this->dispatchParallel($source, $connection, $queue, $owner, $ttl, $token, (bool) $this->option('profile'));
+                $this->dispatchParallel($source, $connection, $queue, $owner, $ttl, $token, $profile, $profileSamples);
                 $handedOff = true;
 
                 if ($this->option('wait')) {
@@ -222,7 +537,7 @@ final class ImportCommand extends Command
             $queue = $this->option('queue') ?: $source->syncWithSearchUsingQueue();
 
             $start = microtime(true);
-            $this->dispatchSequential($source, $connection, $queue, $owner, $ttl, (bool) $this->option('profile'));
+            $this->dispatchSequential($source, $connection, $queue, $owner, $ttl, $profile, $profileSamples);
             $handedOff = true;
 
             // Queued sequential is fire-and-forget (runs on a worker), so it can
@@ -247,6 +562,262 @@ final class ImportCommand extends Command
     }
 
     /**
+     * Measure a sample of chunks against a throwaway index, report, and exit.
+     *
+     * SUCCESS whenever the probe RAN, however alarming what it found: findings
+     * are diagnostics, and an operator who asked "how slow is this?" must not
+     * have the answer delivered as a failing exit code. FAILURE is reserved for
+     * a probe that could not run at all — an unplannable source, or a probe
+     * index that could not be created.
+     */
+    private function probe(ImportSource $source, string $searchable): int
+    {
+        $samples = $this->probeSamplesOption() ?? self::DEFAULT_PROBE_SAMPLES;
+        $workers = $this->probeWorkersOption() ?? self::DEFAULT_PROBE_WORKERS;
+
+        // The same timeout PullChunkJob diagnoses a chunk against, so "this
+        // chunk is near its timeout" means the same thing here as it does in a
+        // real import. Null when SCOUT_QUEUE_TIMEOUT is unset, which suppresses
+        // the timeout rules rather than inventing a budget to compare against.
+        $report = (new ImportProbe($source))->run($samples, Config::queueTimeout());
+
+        return $this->renderProbe($report, $searchable, $workers);
+    }
+
+    /**
+     * Print a probe report: the plan and the index it used, the per-sample
+     * table, the aggregates, the extrapolation, then the findings with their
+     * remedies — and finally the fate of the throwaway index, so an interrupted
+     * probe still leaves a name an operator can act on.
+     *
+     * @param  ProbeReport  $report
+     */
+    private function renderProbe(array $report, string $searchable, int $workers): int
+    {
+        if (! $report['ok']) {
+            $this->error($this->transLine('scout::import.probe_failed', [
+                'searchable' => $searchable,
+                'reason' => $report['error'] ?? '?',
+            ]));
+            $this->renderProbeWarnings($report['warnings']);
+
+            return self::FAILURE;
+        }
+
+        if ($report['total_chunks'] === 0) {
+            $this->line($this->transLine('scout::import.probe_empty', ['searchable' => $searchable]));
+            $this->renderProbeWarnings($report['warnings']);
+
+            return self::SUCCESS;
+        }
+
+        $this->line($this->transLine('scout::import.probe_header', [
+            'searchable' => $searchable,
+            'samples' => count($report['sampled']),
+            'total' => $report['total_chunks'],
+            'chunk' => $report['chunk_size'] ?? '?',
+            'index' => $report['index'],
+        ]));
+
+        // Up front, before the numbers they qualify: a concurrent import means
+        // every row below is inflated, and an operator reading the table needs
+        // to know that before they act on it.
+        $this->renderProbeWarnings($report['warnings']);
+
+        $rows = [];
+        foreach ($report['samples'] as $sample) {
+            $metrics = $sample['metrics'];
+
+            if ($metrics === null) {
+                $this->warn($this->transLine('scout::import.probe_sample_failed', [
+                    'chunk' => $sample['chunk_id'],
+                    'reason' => $sample['error'] ?? '?',
+                ]));
+
+                continue;
+            }
+
+            $rows[] = [
+                $sample['chunk_id'],
+                $this->metric($metrics, 'fetched'),
+                $this->metric($metrics, 'indexed'),
+                $this->metric($metrics, 'fetch_ms'),
+                $this->metric($metrics, 'filter_ms'),
+                $this->metric($metrics, 'index_ms'),
+                $this->metric($metrics, 'total_ms'),
+                $this->metricQueries($metrics),
+                $this->metric($metrics, 'payload_kb'),
+            ];
+        }
+
+        if ($rows !== []) {
+            $this->table([
+                trans('scout::import.probe_table_chunk'),
+                trans('scout::import.probe_table_fetched'),
+                trans('scout::import.probe_table_indexed'),
+                trans('scout::import.probe_table_fetch_ms'),
+                trans('scout::import.probe_table_filter_ms'),
+                trans('scout::import.probe_table_index_ms'),
+                trans('scout::import.probe_table_total_ms'),
+                trans('scout::import.probe_table_queries'),
+                trans('scout::import.probe_table_payload_kb'),
+            ], $rows);
+        }
+
+        $aggregates = $report['aggregates'];
+        if ($aggregates['measured'] > 0) {
+            $this->line($this->transLine('scout::import.probe_aggregates', [
+                'searchable' => $searchable,
+                'measured' => $aggregates['measured'],
+                'min_ms' => (string) $aggregates['min_ms'],
+                'median_ms' => (string) $aggregates['median_ms'],
+                'mean_ms' => (string) $aggregates['mean_ms'],
+                'max_ms' => (string) $aggregates['max_ms'],
+                'fetched' => $aggregates['fetched'],
+                'indexed' => $aggregates['indexed'],
+            ]));
+        }
+
+        $estimate = $report['estimate'];
+        if ($estimate !== null) {
+            // The probe reports serial seconds only; dividing them across N
+            // workers is the operator's own assumption, so it is applied here
+            // where the option lives — and labelled an estimate either way.
+            $workers = max(1, $workers);
+
+            $this->line($this->transLine('scout::import.probe_estimate', [
+                'measured' => $estimate['measured'],
+                'chunks' => $estimate['chunks'],
+                'mean_s' => (string) $estimate['mean_seconds'],
+                'serial' => $this->humanElapsed($estimate['serial_seconds']),
+                'parallel' => $this->humanElapsed($estimate['serial_seconds'] / $workers),
+                'workers' => $workers,
+            ]));
+
+            // Only worth saying when the two means actually differ: it explains
+            // why the estimate is built on a smaller number than the Total ms
+            // column above, which otherwise looks like an arithmetic error.
+            if ($estimate['overhead_seconds'] > 0.0) {
+                $this->line($this->transLine('scout::import.probe_estimate_overhead', [
+                    'mean_s' => (string) $estimate['mean_seconds'],
+                    'overhead_s' => (string) $estimate['overhead_seconds'],
+                    'measured_mean_s' => (string) $estimate['measured_mean_seconds'],
+                ]));
+            }
+        }
+
+        $this->renderProbeFindings($report, $searchable);
+
+        // Named on the way out as well as in the header: an operator who ^C's a
+        // probe never sees this line, and its absence is exactly the signal that
+        // an index may have been left behind.
+        if ($report['created'] && $report['torn_down']) {
+            $this->line($this->transLine('scout::import.probe_cleaned_up', ['index' => $report['index']]));
+        }
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * The findings, each as a warn line with its remedy indented underneath.
+     *
+     * Rendered from the SAME profile_finding_<code> / _hint sentences the --wait
+     * renderer uses, through the same two helpers: a diagnosis must read
+     * identically whether it was measured by a worker during an import or by a
+     * probe here, and one set of sentences per code is the only way to keep that
+     * true. Findings NEVER touch the exit code.
+     *
+     * @param  ProbeReport  $report
+     */
+    private function renderProbeFindings(array $report, string $searchable): void
+    {
+        $findings = $report['findings'];
+
+        if ($findings === []) {
+            // A clean bill of health is only claimable when something was
+            // actually measured: a probe whose every sample failed has found
+            // nothing, which is not the same as having found nothing wrong.
+            if ($report['aggregates']['measured'] > 0) {
+                $this->line($this->transLine('scout::import.probe_no_findings', ['searchable' => $searchable]));
+            }
+
+            return;
+        }
+
+        $this->warn($this->transLine('scout::import.probe_findings_header', [
+            'searchable' => $searchable,
+            'findings' => count($findings),
+        ]));
+
+        foreach ($findings as $finding) {
+            // The shape the shared renderers expect: the worst example measured
+            // for this code, plus how many sampled chunks hit it.
+            $example = [
+                'count' => $finding['count'],
+                'weight' => $finding['weight'],
+                'data' => $finding['data'],
+            ];
+
+            $this->warn('  '.$this->transLine('scout::import.probe_finding_occurrences', [
+                'count' => $finding['count'],
+                'sampled' => count($report['sampled']),
+                'message' => $this->profileFindingMessage($searchable, $finding['code'], $example),
+            ]));
+            $this->line('    '.$this->profileFindingHint($searchable, $finding['code'], $example));
+        }
+    }
+
+    /**
+     * @param  list<string>  $warnings
+     */
+    private function renderProbeWarnings(array $warnings): void
+    {
+        foreach ($warnings as $warning) {
+            $this->warn($warning);
+        }
+    }
+
+    /**
+     * One measured value as a table cell.
+     *
+     * Metrics are free-form diagnostic output rather than a schema (see
+     * PullFromSource::lastProfile), so anything unreadable degrades to "?". A
+     * report whose whole job is to explain a slow import must not be the thing
+     * that crashes on a key that never arrived.
+     *
+     * @param  array<array-key, mixed>  $metrics
+     */
+    private function metric(array $metrics, string $key): string
+    {
+        $value = $metrics[$key] ?? null;
+
+        return is_numeric($value) ? (string) $value : '?';
+    }
+
+    /**
+     * The per-phase query counts as one cell, "fetch/filter/index".
+     *
+     * Split rather than summed because the split is the diagnosis: a count that
+     * balloons in the index phase is an N+1 inside toSearchableArray(), the same
+     * number ballooning in the filter phase is shouldBeSearchable() querying per
+     * model, and the total on its own distinguishes neither.
+     *
+     * @param  array<array-key, mixed>  $metrics
+     */
+    private function metricQueries(array $metrics): string
+    {
+        $queries = $metrics['queries'] ?? null;
+
+        if (! is_array($queries)) {
+            return '?';
+        }
+
+        return $this->metric($queries, 'fetch')
+            .'/'.$this->metric($queries, 'filter')
+            .'/'.$this->metric($queries, 'index');
+    }
+
+    /**
      * Block until a --parallel run record reaches a terminal status.
      */
     private function waitForRun(string $searchable, string $token, ?string $connection, ?string $queue): int
@@ -255,6 +826,18 @@ final class ImportCommand extends Command
         $start = microtime(true);
         $appearTimeout = $this->intConfig('elasticsearch.import.wait_timeout', self::DEFAULT_WAIT_TIMEOUT);
         $store = app(ImportRunStore::class);
+
+        // Profiling diagnoses travel back from the workers through the run record
+        // (see PullChunkJob::publishProfileFindings), and --wait is the only place
+        // in this package where a process is still around to print them. Poll for
+        // them ONLY when this run can actually have them: a plain --wait must not
+        // pay a Redis round trip per iteration for a hash nobody ever writes.
+        //
+        // Codes already announced, so a finding is introduced once and does not
+        // reappear on every poll as its occurrence count climbs. Local to this
+        // call, not the instance: each searchable reports its own run.
+        $findingsExpected = $this->profileFindingsExpected();
+        $printedFindings = [];
 
         // Wait for the worker to run the prepare stages + DispatchPullChunks and
         // publish the run record. A worker first has to pick up the chain, clean
@@ -328,12 +911,32 @@ final class ImportCommand extends Command
                 $this->line($line);
                 $lastLine = $line;
             }
+
+            // Rides the existing 500ms progress cadence rather than a timer of its
+            // own: the read is a couple of small hashes bounded by the findings cap,
+            // and a diagnosis is worth most while the operator can still stop the
+            // import. The prepare loop above deliberately does not poll — no chunk
+            // has run yet at that point, so no finding can exist.
+            if ($findingsExpected) {
+                $this->renderNewProfileFindings($store, $token, $searchable, $printedFindings);
+            }
+
             usleep(500000);
             $snapshot = $store->snapshot($token);
         }
 
         $elapsed = $this->humanElapsed(microtime(true) - $start);
         $total = (int) $snapshot['total'];
+
+        // Every finding once more, with its occurrence count, before the outcome
+        // line — the last poll above can miss a chunk that published between it
+        // and the terminal transition, and that chunk is often the interesting
+        // one. Printed for a succeeded run too: an import that finished cleanly
+        // while lazy-loading a relation per model is still worth reporting.
+        // Findings are DIAGNOSTICS and cannot change the code returned below.
+        if ($findingsExpected) {
+            $this->renderProfileFindingsSummary($store, $token, $searchable, $printedFindings);
+        }
 
         if ($snapshot['status'] === ImportRunStore::STATUS_FAILED) {
             $this->error(trans('scout::import.wait_failed', [
@@ -373,6 +976,230 @@ final class ImportCommand extends Command
     }
 
     /**
+     * Whether profiling findings can exist for this run, i.e. whether it is worth
+     * polling the run record for them.
+     *
+     * Two conditions, both necessary: profiling was requested, i.e.
+     * --profile-samples named a usable target (a count, or "all" for every
+     * chunk); and publication is not switched off wholesale —
+     * SCOUT_IMPORT_PROFILE_FINDINGS=0 makes the workers write nothing, so reading
+     * would be pure waste.
+     *
+     * Reads the options defensively. Every other option read in this class happens
+     * on the normal Artisan path, where the input is always bound; this one is
+     * reached from waitForRun(), which is also driven directly (by reflection) with
+     * only the output wired up. An unbound input means "no options were given",
+     * which for a diagnostic read is exactly the safe answer — and it keeps a
+     * findings poll from ever being the thing that breaks a --wait run.
+     */
+    private function profileFindingsExpected(): bool
+    {
+        if ($this->input === null) {
+            return false;
+        }
+
+        if ($this->profileSamplesOption() === null) {
+            return false;
+        }
+
+        return $this->intConfig('elasticsearch.import.profile_findings', self::DEFAULT_PROFILE_FINDINGS) > 0;
+    }
+
+    /**
+     * Print every finding whose code has not been announced yet: the diagnosis at
+     * warn level, then its remedy on an indented line.
+     *
+     * @param  array<string, bool>  $printed  Codes already announced; grows here
+     */
+    private function renderNewProfileFindings(ImportRunStore $store, string $token, string $searchable, array &$printed): void
+    {
+        foreach ($this->pollProfileFindings($store, $token) as $code => $finding) {
+            if (isset($printed[$code])) {
+                continue;
+            }
+
+            $printed[$code] = true;
+
+            $this->warn($this->profileFindingMessage($searchable, $code, $finding));
+            $this->line('  '.$this->profileFindingHint($searchable, $code, $finding));
+        }
+    }
+
+    /**
+     * Print the closing roll-up: one line per finding, carrying how many chunks
+     * hit it and the worst example measured.
+     *
+     * @param  array<string, bool>  $printed  Codes already announced; grows here
+     */
+    private function renderProfileFindingsSummary(ImportRunStore $store, string $token, string $searchable, array &$printed): void
+    {
+        $findings = $this->pollProfileFindings($store, $token);
+
+        // Nothing found is worth saying nothing about: a clean profiled run should
+        // look exactly like a clean unprofiled one.
+        if ($findings === []) {
+            return;
+        }
+
+        $this->warn($this->transLine('scout::import.profile_findings_header', [
+            'searchable' => $searchable,
+            'findings' => count($findings),
+        ]));
+
+        foreach ($findings as $code => $finding) {
+            $this->warn('  '.$this->transLine('scout::import.profile_finding_occurrences', [
+                'count' => $finding['count'],
+                'message' => $this->profileFindingMessage($searchable, $code, $finding),
+            ]));
+
+            // The remedy was printed when the code first appeared, so repeat it
+            // only for a code that never got an inline line — one published
+            // between the last poll and the terminal status. A late finding must
+            // never be reported without the fix that goes with it.
+            if (! isset($printed[$code])) {
+                $printed[$code] = true;
+                $this->line('    '.$this->profileFindingHint($searchable, $code, $finding));
+            }
+        }
+    }
+
+    /**
+     * Read the run's published findings, or none at all when that read fails.
+     *
+     * A DIAGNOSTIC MUST NEVER FAIL AN IMPORT — the same rule the publishing side
+     * obeys (see PullChunkJob::publishProfileFindings), applied to the reading
+     * side. This runs inside the poll loop of a run that is otherwise perfectly
+     * healthy, so a Redis hiccup or a payload this release cannot make sense of
+     * has to cost the operator a diagnosis, never the exit code of a finished
+     * import.
+     *
+     * @return array<string, array{count:int, weight:float, data:array<string, scalar>}>
+     */
+    private function pollProfileFindings(ImportRunStore $store, string $token): array
+    {
+        try {
+            return $store->profileFindings($token);
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
+     * One finding as a sentence naming the numbers that justify it.
+     *
+     * @param  array{count:int, weight:float, data:array<string, scalar>}  $finding
+     */
+    private function profileFindingMessage(string $searchable, string $code, array $finding): string
+    {
+        $key = 'scout::import.profile_finding_'.$code;
+
+        // A code this release has no sentence for: a worker running a newer
+        // version of the package published it. Report it verbatim rather than
+        // dropping the finding (or printing a raw translation key at the
+        // operator).
+        if (! Lang::has($key)) {
+            return $this->transLine('scout::import.profile_finding_unknown', [
+                'searchable' => $searchable,
+                'code' => $code,
+                'data' => $this->describeFindingData($finding['data']),
+            ]);
+        }
+
+        return $this->transLine($key, $this->findingReplacements($searchable, $code, $finding));
+    }
+
+    /**
+     * The remedy line that goes with a finding.
+     *
+     * Looked up independently of the message so a code carrying one and not the
+     * other still prints something useful.
+     *
+     * @param  array{count:int, weight:float, data:array<string, scalar>}  $finding
+     */
+    private function profileFindingHint(string $searchable, string $code, array $finding): string
+    {
+        $key = 'scout::import.profile_finding_'.$code.'_hint';
+
+        if (! Lang::has($key)) {
+            return $this->transLine('scout::import.profile_finding_unknown_hint');
+        }
+
+        return $this->transLine($key, $this->findingReplacements($searchable, $code, $finding));
+    }
+
+    /**
+     * Placeholder values for one finding: every known placeholder as "?", then the
+     * run's own facts and whatever the worker actually measured on top.
+     *
+     * @param  array{count:int, weight:float, data:array<string, scalar>}  $finding
+     * @return array<string, string>
+     */
+    private function findingReplacements(string $searchable, string $code, array $finding): array
+    {
+        $replacements = [];
+
+        foreach (self::PROFILE_FINDING_PLACEHOLDERS as $placeholder) {
+            $replacements[$placeholder] = '?';
+        }
+
+        foreach ($finding['data'] as $field => $value) {
+            $replacements[$field] = $this->scalarToString($value);
+        }
+
+        $replacements['searchable'] = $searchable;
+        $replacements['code'] = $code;
+        $replacements['count'] = (string) $finding['count'];
+
+        return $replacements;
+    }
+
+    /**
+     * A finding's raw data as "key=value, key=value", used only when the code
+     * itself is unknown to this release and there is no sentence to put it in.
+     *
+     * @param  array<string, scalar>  $data
+     */
+    private function describeFindingData(array $data): string
+    {
+        if ($data === []) {
+            return $this->transLine('scout::import.profile_finding_no_data');
+        }
+
+        $parts = [];
+        foreach ($data as $field => $value) {
+            $parts[] = $field.'='.$this->scalarToString($value);
+        }
+
+        return implode(', ', $parts);
+    }
+
+    /**
+     * @param  scalar  $value
+     */
+    private function scalarToString($value): string
+    {
+        if (is_bool($value)) {
+            return $value ? 'true' : 'false';
+        }
+
+        return (string) $value;
+    }
+
+    /**
+     * trans() constrained to a single line of output: the translator can hand back
+     * an array (a whole group, or a badly overridden key), and a published
+     * diagnosis is not worth an "array to string" crash in a finished import.
+     *
+     * @param  array<string, string|int>  $replace
+     */
+    private function transLine(string $key, array $replace = []): string
+    {
+        $line = trans($key, $replace);
+
+        return is_string($line) ? $line : $key;
+    }
+
+    /**
      * Count documents in the freshly built index by its concrete name, so the
      * total is independent of the alias swap timing. Best effort — returns null
      * if the index is unavailable.
@@ -405,9 +1232,9 @@ final class ImportCommand extends Command
         return intdiv($minutes, 60).'h '.($minutes % 60).'m';
     }
 
-    private function dispatchSequential(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, bool $profile = false): void
+    private function dispatchSequential(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, bool $profile = false, ?int $profileSamples = null): void
     {
-        $job = new Import($source, $owner, $ttl, $profile);
+        $job = new Import($source, $owner, $ttl, $profile, $profileSamples);
         $job->timeout = Config::queueTimeout();
 
         if (config('scout.queue')) {
@@ -421,7 +1248,7 @@ final class ImportCommand extends Command
         dispatch($job)->allOnQueue($queue)->allOnConnection($connection);
     }
 
-    private function dispatchParallel(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, string $progressToken, bool $profile = false): void
+    private function dispatchParallel(ImportSource $source, ?string $connection, ?string $queue, string $owner, int $ttl, string $progressToken, bool $profile = false, ?int $profileSamples = null): void
     {
         $index = Index::fromSource($source);
         $timeout = Config::queueTimeout();
@@ -442,7 +1269,7 @@ final class ImportCommand extends Command
         $stages = [
             $cleanUp,
             $createIndex,
-            new DispatchPullChunks($source, $index, $connection, $queue, $owner, $ttl, $progressToken, $profile),
+            new DispatchPullChunks($source, $index, $connection, $queue, $owner, $ttl, $progressToken, $profile, 0, null, $profileSamples),
         ];
 
         foreach ($stages as $stage) {

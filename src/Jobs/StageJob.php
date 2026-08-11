@@ -127,17 +127,22 @@ final class StageJob implements ShouldQueue
      * retry never hot-loops and de-clusters the sibling chunks that were all
      * released at the same instant, which is what caused the lock pile-up.
      *
-     * Returns an empty schedule when there is nothing to retry — the prepare
-     * stages (no backoff base) and any job left at the default tries=1.
+     * Returns null — not [] — when there is nothing to retry (the prepare stages
+     * have no backoff base, and any job left at the default tries=1 has no
+     * retry). An empty array is NOT treated as "no backoff" downstream: Queue
+     * implodes the schedule to "", and Worker::calculateBackoff then casts the
+     * first (empty) element to int 0, which releases the job for immediate
+     * re-delivery with a zero visibility timeout. Null is what makes the queue
+     * fall back to its own configured delay.
      *
-     * @return int[]
+     * @return int[]|null
      */
-    public function backoff(): array
+    public function backoff(): ?array
     {
         $count = $this->tries - 1;
 
         if ($this->backoffBase === null || $count < 1) {
-            return [];
+            return null;
         }
 
         $cap = $this->backoffCap ?? $this->backoffBase;
