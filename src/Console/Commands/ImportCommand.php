@@ -95,7 +95,23 @@ final class ImportCommand extends Command
         'queries', 'fetched',
         'fetch_ms', 'index_ms', 'bulk_ms',
         'avg_kb', 'payload_kb', 'indexed',
+        // The slowest query of the dominant phase, which ProfileDiagnostics adds
+        // to fetch_dominant and index_dominant only. Registered under BOTH
+        // spellings: `slow_sql`/`slow_ms` as the worker publishes them into the
+        // run record (a cross-version wire contract, not renamed here), and the
+        // short `sql`/`ms` the profile_finding_slow_query sentence reads. Either
+        // one absent therefore prints "?" rather than a literal ":sql".
+        'slow_sql', 'slow_ms', 'sql', 'ms',
     ];
+
+    /**
+     * The phases a chunk is measured in, in the order they run — the sub-keys of
+     * the `slow_query` map PullFromSource publishes, and the order the --probe
+     * slow-query block prints them in.
+     *
+     * @var list<string>
+     */
+    const PROFILED_PHASES = ['fetch', 'filter', 'index'];
 
     /**
      * @inheritdoc
@@ -708,6 +724,13 @@ final class ImportCommand extends Command
 
         $this->renderProbeFindings($report, $searchable);
 
+        // After the findings, because it answers the question they raise: the
+        // findings say which phase owns the chunk, this says which statement owns
+        // the phase. Printed even when no finding fired — a fetch that is merely
+        // 55% of the chunk is under the dominance threshold and still worth a
+        // look at the query behind it.
+        $this->renderProbeSlowQueries($report, $searchable);
+
         // Named on the way out as well as in the header: an operator who ^C's a
         // probe never sees this line, and its absence is exactly the signal that
         // an index may have been left behind.
@@ -764,6 +787,96 @@ final class ImportCommand extends Command
                 'message' => $this->profileFindingMessage($searchable, $finding['code'], $example),
             ]));
             $this->line('    '.$this->profileFindingHint($searchable, $finding['code'], $example));
+            $this->renderProfileFindingSlowQuery($searchable, $finding['code'], $example, '      ');
+        }
+    }
+
+    /**
+     * The slowest query each phase ran, worst across every sampled chunk.
+     *
+     * This is the line the whole feature exists for. `--probe` already reports
+     * that a chunk spent 258 seconds fetching and issued 5 queries; an operator
+     * cannot act on that, because it never says WHICH query. The query log is
+     * already enabled on a profiled chunk and already carries the statement and
+     * its duration (PullFromSource::slowestQuery keeps the worst per phase), so
+     * naming it here costs nothing extra to measure — only to print.
+     *
+     * The SQL is printed on a line of its own, verbatim and unwrapped by any
+     * sentence, so it can be selected and pasted straight into EXPLAIN. It is the
+     * statement only: `?` placeholders, never the bindings (see the lang file —
+     * bound values are row data and must not reach a log or the run record).
+     *
+     * Everything is read defensively: `slow_query` arrives from a worker that may
+     * run a different release of this package, and a report whose job is to
+     * explain a slow import must not crash on a key that never arrived.
+     *
+     * @param  ProbeReport  $report
+     */
+    private function renderProbeSlowQueries(array $report, string $searchable): void
+    {
+        /** @var array<string, array{sql: string, ms: float, chunk: int}> $slowest */
+        $slowest = [];
+
+        foreach ($report['samples'] as $sample) {
+            $metrics = $sample['metrics'];
+
+            if ($metrics === null) {
+                continue;
+            }
+
+            $captured = $metrics['slow_query'] ?? null;
+
+            if (! is_array($captured)) {
+                continue;
+            }
+
+            foreach (self::PROFILED_PHASES as $phase) {
+                $entry = $captured[$phase] ?? null;
+
+                // Null is the normal case for a phase that ran no query at all
+                // (a filter reading only loaded attributes, an empty chunk).
+                if (! is_array($entry)) {
+                    continue;
+                }
+
+                $sql = $entry['sql'] ?? null;
+
+                if (! is_string($sql) || $sql === '') {
+                    continue;
+                }
+
+                $ms = $entry['ms'] ?? null;
+                $ms = is_numeric($ms) ? (float) $ms : 0.0;
+
+                // Strict >, so the earliest chunk reaching the worst time wins
+                // and the block does not shuffle between identical runs.
+                if (! isset($slowest[$phase]) || $ms > $slowest[$phase]['ms']) {
+                    $slowest[$phase] = ['sql' => $sql, 'ms' => $ms, 'chunk' => $sample['chunk_id']];
+                }
+            }
+        }
+
+        if ($slowest === []) {
+            return;
+        }
+
+        $this->line($this->transLine('scout::import.probe_slow_queries_header', [
+            'searchable' => $searchable,
+        ]));
+
+        // Iterating the phase list rather than the map keeps the output in
+        // fetch/filter/index order however the samples arrived.
+        foreach (self::PROFILED_PHASES as $phase) {
+            if (! isset($slowest[$phase])) {
+                continue;
+            }
+
+            $this->line('  '.$this->transLine('scout::import.probe_slow_query', [
+                'phase' => $this->transLine('scout::import.probe_slow_query_phase_'.$phase),
+                'ms' => (string) round($slowest[$phase]['ms'], 1),
+                'chunk' => $slowest[$phase]['chunk'],
+            ]));
+            $this->line('    '.$slowest[$phase]['sql']);
         }
     }
 
@@ -1022,6 +1135,7 @@ final class ImportCommand extends Command
 
             $this->warn($this->profileFindingMessage($searchable, $code, $finding));
             $this->line('  '.$this->profileFindingHint($searchable, $code, $finding));
+            $this->renderProfileFindingSlowQuery($searchable, $code, $finding, '    ');
         }
     }
 
@@ -1059,6 +1173,7 @@ final class ImportCommand extends Command
             if (! isset($printed[$code])) {
                 $printed[$code] = true;
                 $this->line('    '.$this->profileFindingHint($searchable, $code, $finding));
+                $this->renderProfileFindingSlowQuery($searchable, $code, $finding, '      ');
             }
         }
     }
@@ -1125,6 +1240,52 @@ final class ImportCommand extends Command
         }
 
         return $this->transLine($key, $this->findingReplacements($searchable, $code, $finding));
+    }
+
+    /**
+     * The extra line under a remedy naming the query the dominant phase spent its
+     * time in — nothing at all when the finding carries no query.
+     *
+     * The third renderer sharing profile_finding_* sentences between --wait and
+     * --probe, for the same reason as the other two: a diagnosis must read
+     * identically wherever it was measured. Only fetch_dominant and
+     * index_dominant carry `slow_sql` (see ProfileDiagnostics), so every other
+     * code silently prints nothing here rather than needing a branch per code.
+     *
+     * The existing finding message and hint are deliberately left untouched: a
+     * 300-character statement does not belong inside a sentence an operator reads
+     * on every occurrence. $indent puts it under the hint of whichever caller it
+     * is, which is the only thing that differs between the three.
+     *
+     * PRIVACY: `slow_sql` is the statement with `?` placeholders. Query bindings
+     * are row data (emails, names, tokens) and are never captured upstream, so
+     * there is nothing to redact here — and nothing in this class may start
+     * reading them.
+     *
+     * @param  array{count:int, weight:float, data:array<string, scalar>}  $finding
+     */
+    private function renderProfileFindingSlowQuery(string $searchable, string $code, array $finding, string $indent): void
+    {
+        $sql = $finding['data']['slow_sql'] ?? null;
+
+        // Absent for every code but the two dominance findings, and absent even
+        // for those when the phase logged no query. An empty string is treated as
+        // absent too: a log entry with no usable statement is not worth a line.
+        if (! is_string($sql) || $sql === '') {
+            return;
+        }
+
+        $replacements = $this->findingReplacements($searchable, $code, $finding);
+
+        // The sentence names :ms and :sql; the published data names them slow_ms
+        // and slow_sql. Aliased rather than renamed on either side — the data keys
+        // travel between package versions in the run record, and the sentence
+        // reads better short. Both spellings are seeded with "?" by
+        // PROFILE_FINDING_PLACEHOLDERS, so a missing slow_ms degrades to "?".
+        $replacements['sql'] = $replacements['slow_sql'];
+        $replacements['ms'] = $replacements['slow_ms'];
+
+        $this->line($indent.$this->transLine('scout::import.profile_finding_slow_query', $replacements));
     }
 
     /**

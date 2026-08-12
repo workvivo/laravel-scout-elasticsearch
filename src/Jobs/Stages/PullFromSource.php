@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Matchish\ScoutElasticSearch\Engines\ElasticSearchEngine;
 use Matchish\ScoutElasticSearch\Searchable\ImportSource;
 use OpenSearch\Client;
@@ -15,6 +16,26 @@ use OpenSearch\Client;
  */
 final class PullFromSource implements StageInterface
 {
+    /**
+     * Characters of SQL kept for a phase's slowest query before it is cut off
+     * with an ellipsis. Bounded because this string lands in a log line (and,
+     * further downstream, in a JSON run record) and an untruncated statement
+     * from a wide model with a dozen joins can run to several kilobytes.
+     *
+     * 300 is chosen to be long enough to reach past the select list into the
+     * FROM / JOIN / WHERE that actually identify the missing index.
+     */
+    public const SLOW_QUERY_SQL_CHARS = 300;
+
+    /**
+     * How many consecutive `?` placeholders make a "run" worth collapsing.
+     *
+     * Three, not two: `in (?, ?)` is already readable and collapsing it would
+     * lose more than it saves, while `in (?, ?, ?, ...)` over a 1000-row eager
+     * load is pure noise that would otherwise consume the whole budget above.
+     */
+    private const PLACEHOLDER_RUN_MIN = 3;
+
     /**
      * @var ImportSource
      */
@@ -99,6 +120,10 @@ final class PullFromSource implements StageInterface
      * phase's DB query count is recorded. Together these pinpoint an N+1: the
      * phase whose query count balloons, and the exact relation to eager-load in
      * makeAllSearchableUsing.
+     *
+     * Each phase also records its slowest statement (SQL only, see
+     * {@see slowestQuery}), because a query count answers "how many" but never
+     * "which one" — and on a slow fetch, which one is the whole question.
      */
     private function handleProfiled(): void
     {
@@ -117,24 +142,32 @@ final class PullFromSource implements StageInterface
         // stays correct; we only observe that it happened.
         Model::preventLazyLoading();
 
+        // Returns [result, query count, slowest query]. The query log was already
+        // being enabled, counted and thrown away here; the slowest entry is read
+        // off the same array before it is flushed, so a phase's worst statement
+        // costs one extra pass over data that already exists in memory. The count
+        // alone tells an operator "the fetch ran 5 queries and took 258 seconds"
+        // without saying WHICH of the 5 — that is the gap this closes.
         $countQueries = function (callable $work): array {
             DB::flushQueryLog();
             DB::enableQueryLog();
             $result = $work();
-            $queries = count(DB::getQueryLog());
+            $log = DB::getQueryLog();
+            $queries = count($log);
+            $slow = self::slowestQuery($log);
             DB::flushQueryLog();
 
-            return [$result, $queries];
+            return [$result, $queries, $slow];
         };
 
         try {
             $t0 = microtime(true);
-            [$fetched, $fetchQueries] = $countQueries(function () {
+            [$fetched, $fetchQueries, $fetchSlow] = $countQueries(function () {
                 return $this->source->get();
             });
             $t1 = microtime(true);
 
-            [$results, $filterQueries] = $countQueries(function () use ($fetched) {
+            [$results, $filterQueries, $filterSlow] = $countQueries(function () use ($fetched) {
                 return $fetched->filter(function (Model $item): bool {
                     return $this->shouldBeSearchable($item);
                 });
@@ -145,7 +178,7 @@ final class PullFromSource implements StageInterface
             $serializeMs = 0.0;
             $bulkMs = 0.0;
             $bytes = 0;
-            [, $indexQueries] = $countQueries(function () use ($results, &$indexed, &$serializeMs, &$bulkMs, &$bytes) {
+            [, $indexQueries, $indexSlow] = $countQueries(function () use ($results, &$indexed, &$serializeMs, &$bulkMs, &$bytes) {
                 if ($results->isEmpty()) {
                     return;
                 }
@@ -203,6 +236,15 @@ final class PullFromSource implements StageInterface
                 'filter' => $filterQueries,
                 'index' => $indexQueries,
             ],
+            // The slowest statement of each phase, or null when the phase issued
+            // no query at all. This is what turns "fetch took 258s over 5
+            // queries" into a statement an operator can paste into EXPLAIN.
+            // SQL ONLY, never bindings — see slowestQuery().
+            'slow_query' => [
+                'fetch' => $fetchSlow,
+                'filter' => $filterSlow,
+                'index' => $indexSlow,
+            ],
             // Empty means nothing lazy-loaded: the index time is genuine
             // serialization + the Elasticsearch bulk request, not an N+1.
             'lazy_loads' => $lazyLoads,
@@ -214,11 +256,100 @@ final class PullFromSource implements StageInterface
     }
 
     /**
+     * The slowest entry of one phase's query log, as
+     * ['sql' => string, 'ms' => float], or null when the phase logged nothing.
+     *
+     * PRIVACY — DELIBERATE AND LOAD-BEARING: only the `query` string is read,
+     * which Laravel stores with `?` placeholders, and the sibling `bindings`
+     * array is never touched. Bindings hold real row data (emails, names, API
+     * tokens) and this value travels into the application log and into the Redis
+     * run record, where it is neither redacted nor short-lived. Anyone extending
+     * this must keep it placeholders-only.
+     *
+     * Defensive about the log's shape on purpose: the query log is owned by the
+     * framework, not by us, and its entries have gained and lost keys across
+     * releases. A drifted entry degrades to '' / 0.0 rather than throwing inside
+     * a diagnostic that only exists to explain a slow import.
+     *
+     * @param  array<array-key, mixed>  $log  DB::getQueryLog() for a single phase
+     * @return array{sql: string, ms: float}|null
+     */
+    private static function slowestQuery(array $log): ?array
+    {
+        $slowest = null;
+        $slowestMs = null;
+
+        foreach ($log as $entry) {
+            if (! is_array($entry)) {
+                continue;
+            }
+
+            $time = $entry['time'] ?? null;
+            $ms = is_numeric($time) ? (float) $time : 0.0;
+
+            // Strictly greater, so the FIRST of several equally slow statements
+            // wins: on a chunk whose queries are all the same cost, the earliest
+            // one is the one an operator can reason about in isolation.
+            if ($slowestMs !== null && $ms <= $slowestMs) {
+                continue;
+            }
+
+            $sql = $entry['query'] ?? null;
+
+            $slowest = [
+                'sql' => self::compactSql(is_string($sql) ? $sql : ''),
+                'ms' => round($ms, 1),
+            ];
+            $slowestMs = $ms;
+        }
+
+        return $slowest;
+    }
+
+    /**
+     * One log line's worth of SQL: single-spaced, placeholder runs collapsed,
+     * then truncated.
+     *
+     * The order matters. An eager load over a 1000-row chunk produces
+     * `where "id" in (?, ?, ?, ... x1000)`, which is ~3000 characters of nothing
+     * before any truncation limit is reached — truncating first would return a
+     * wall of question marks and cut off the table names and joins that are the
+     * entire diagnostic value. So runs of {@see PLACEHOLDER_RUN_MIN} or more
+     * comma-separated placeholders collapse to a marker naming the count
+     * (`in (?×1000)`), which both shortens the statement and preserves the fact
+     * that it was a 1000-key IN — itself a finding.
+     *
+     * Whitespace is normalised first so that placeholders split across newlines
+     * still read as one run, and so one query stays one log line.
+     */
+    private static function compactSql(string $sql): string
+    {
+        $normalized = preg_replace('/\s+/', ' ', trim($sql));
+        if (! is_string($normalized)) {
+            $normalized = $sql;
+        }
+
+        $collapsed = preg_replace_callback(
+            '/\?(?:\s*,\s*\?){'.(self::PLACEHOLDER_RUN_MIN - 1).',}/',
+            function (array $matches): string {
+                return '?×'.substr_count($matches[0], '?');
+            },
+            $normalized
+        );
+        if (! is_string($collapsed)) {
+            $collapsed = $normalized;
+        }
+
+        return Str::limit($collapsed, self::SLOW_QUERY_SQL_CHARS);
+    }
+
+    /**
      * The metrics of the chunk this instance just profiled, or null when it did
      * not profile (profiling off, or not a sampled chunk).
      *
      * Keys: source, fetched, indexed, fetch_ms, filter_ms, index_ms,
-     * serialize_ms, bulk_ms, payload_kb, total_ms, queries (fetch|filter|index)
+     * serialize_ms, bulk_ms, payload_kb, total_ms, queries (fetch|filter|index),
+     * slow_query (fetch|filter|index => ['sql' => string, 'ms' => float]|null)
      * and lazy_loads ("Class::relation" => hit count).
      *
      * @return array<string, mixed>|null

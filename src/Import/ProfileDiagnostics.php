@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Matchish\ScoutElasticSearch\Import;
 
+use Illuminate\Support\Str;
+
 /**
  * Turns one profiled chunk's raw metrics into DIAGNOSES.
  *
@@ -76,6 +78,19 @@ final class ProfileDiagnostics
     public const NEAR_TIMEOUT_SHARE = 0.5;
 
     /**
+     * Character budget for a finding's `slow_sql`.
+     *
+     * Deliberately harder than the capture side's budget (PullFromSource keeps
+     * ~300) and deliberately its own constant rather than a reference to it: the
+     * two limits answer different questions. Capture writes one log line inside a
+     * worker; this value is JSON-encoded into the Redis run record, held for the
+     * life of the run, and printed on a terminal underneath a finding sentence.
+     * The head of a statement — the verb, the tables, the joins — is what names
+     * the missing index, and it survives 200 characters.
+     */
+    public const SLOW_SQL_CHARS = 200;
+
+    /**
      * Diagnose one profiled chunk.
      *
      * At most one finding per code, so a caller can safely fold the results of
@@ -142,23 +157,33 @@ final class ProfileDiagnostics
         }
 
         if ($totalMs > 0 && $fetchMs / $totalMs > self::DOMINANT_SHARE) {
-            $findings[] = self::finding(self::CODE_FETCH_DOMINANT, $fetchMs, [
+            // The phase's slowest statement is appended (when one was captured)
+            // because "the read owns 90% of the chunk" is the one finding where
+            // an operator's very next question is "which query?" — and the
+            // answer is already in the metrics. Appended, so the pre-existing
+            // keys and their order stay exactly as they were for every consumer
+            // that reads them positionally or asserts on them.
+            $findings[] = self::finding(self::CODE_FETCH_DOMINANT, $fetchMs, array_merge([
                 'fetch_ms' => round($fetchMs, 1),
                 'total_ms' => round($totalMs, 1),
                 'pct' => self::pct($fetchMs, $totalMs),
-            ]);
+            ], self::slowQuery($metrics, 'fetch')));
         }
 
         if ($totalMs > 0 && $indexMs / $totalMs > self::DOMINANT_SHARE) {
             // bulk_ms rides along because it is what splits the two very
             // different causes: cluster round-trip time vs. CPU spent building
             // documents.
-            $findings[] = self::finding(self::CODE_INDEX_DOMINANT, $indexMs, [
+            //
+            // The index phase's slowest statement matters for a third cause the
+            // two timings cannot separate: a query issued while serializing, i.e.
+            // a relation resolved inside toSearchableArray().
+            $findings[] = self::finding(self::CODE_INDEX_DOMINANT, $indexMs, array_merge([
                 'index_ms' => round($indexMs, 1),
                 'total_ms' => round($totalMs, 1),
                 'bulk_ms' => round($bulkMs, 1),
                 'pct' => self::pct($indexMs, $totalMs),
-            ]);
+            ], self::slowQuery($metrics, 'index')));
         }
 
         if ($indexed > 0) {
@@ -222,6 +247,65 @@ final class ProfileDiagnostics
         }
 
         return [$worstRelation, (int) max(0.0, $worstLoads), $relations];
+    }
+
+    /**
+     * One phase's slowest statement as finding data: `['slow_sql' => string,
+     * 'slow_ms' => float]`, or an empty array when the phase captured nothing.
+     *
+     * Empty and not `['slow_sql' => null, ...]` on purpose. `data` is typed
+     * `array<string, scalar>` — a contract the store (which drops non-scalars
+     * silently) and the renderer both rely on — so "absent" has to be expressed
+     * by absence. Renderers therefore test for the key, never for its emptiness.
+     *
+     * PRIVACY: the value copied here is PullFromSource's `sql`, which is Laravel's
+     * query string with `?` placeholders. The sibling `bindings` array is never
+     * captured upstream and must never be plumbed through here: this string is
+     * JSON-encoded into the Redis run record and printed to a terminal, so a
+     * bound value reaching it would leak real row data (emails, names, tokens)
+     * into two places that neither redact nor expire it.
+     *
+     * Defensive like the rest of the class: `slow_query` may be missing entirely
+     * (metrics from a release before capture existed), not an array, or carry a
+     * phase entry that is null or malformed. Every one of those degrades to "no
+     * slow query", which costs the operator a hint and nothing else.
+     *
+     * @param  array<string, mixed>  $metrics
+     * @param  string  $phase  'fetch' or 'index'
+     * @return array<string, scalar>
+     */
+    private static function slowQuery(array $metrics, string $phase): array
+    {
+        $slowQueries = $metrics['slow_query'] ?? null;
+
+        if (! is_array($slowQueries)) {
+            return [];
+        }
+
+        $entry = $slowQueries[$phase] ?? null;
+
+        if (! is_array($entry)) {
+            return [];
+        }
+
+        $sql = $entry['sql'] ?? null;
+
+        // A non-string, or a statement that compacted down to nothing, is not
+        // something an operator can paste into EXPLAIN. Reporting `slow_ms`
+        // without the SQL would be a duration with no subject — the phase timing
+        // already says that — so both keys are dropped together.
+        if (! is_string($sql) || trim($sql) === '') {
+            return [];
+        }
+
+        return [
+            // Str::limit truncates by character, not by byte, which matters
+            // because the collapsed-placeholder marker upstream uses a multibyte
+            // '×': a byte-wise cut could land inside it and emit broken UTF-8
+            // into a JSON encode that would then fail outright.
+            'slow_sql' => Str::limit(trim($sql), self::SLOW_SQL_CHARS),
+            'slow_ms' => round(self::number($entry, 'ms'), 1),
+        ];
     }
 
     /**

@@ -355,11 +355,27 @@ final class ImportProbeTest extends IntegrationTestCase
         $this->assertSame(round($aggregates['mean_production_ms'] / 1000 * self::CHUNKS, 1), $estimate['serial_seconds']);
 
         // Serialization cannot cost negative time, so the production mean never
-        // exceeds the measured one, and the reported overhead is exactly the gap.
+        // exceeds the measured one, and the reported overhead is the gap between
+        // them.
+        //
+        // Compared with a delta, NOT assertSame: ImportProbe rounds the gap
+        // between the two UNROUNDED means, while all this test can see is the two
+        // means already rounded to 1dp. round($a) - round($b) and round($a - $b)
+        // legitimately differ by up to 0.1 (e.g. 100.55 - 97.94 gives 2.7 from the
+        // rounded pair but 2.6 from the raw one), so an exact assertion here is
+        // arithmetically wrong and fails or passes depending on how the run's
+        // timings happen to land.
+        //
+        // The delta is 0.15, not 0.1: each of the two 1dp roundings can move its
+        // value by up to 0.05, so the honest bound IS 0.1 — and a bound of exactly
+        // 0.1 fails on the boundary anyway, because abs(1.6 - 1.5) evaluates to
+        // 0.10000000000000009 in binary floating point. 0.15 clears the bound plus
+        // that epsilon while still pinning the value to a tenth of a millisecond.
         $this->assertLessThanOrEqual($aggregates['mean_ms'], $aggregates['mean_production_ms']);
-        $this->assertSame(
-            round($aggregates['mean_ms'] - $aggregates['mean_production_ms'], 1),
-            $aggregates['overhead_ms']
+        $this->assertEqualsWithDelta(
+            $aggregates['mean_ms'] - $aggregates['mean_production_ms'],
+            $aggregates['overhead_ms'],
+            0.15
         );
         $this->assertSame(round($aggregates['overhead_ms'] / 1000, 3), $estimate['overhead_seconds']);
 

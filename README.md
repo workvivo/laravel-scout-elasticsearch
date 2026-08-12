@@ -586,7 +586,8 @@ with an explicit `--timeout` you have not declared in config). Set
 `--profile-samples` logs one structured `scout:import chunk profile` line per
 profiled chunk with a per-phase breakdown — `fetch_ms`, `filter_ms`, `index_ms`
 (split into `serialize_ms` and `bulk_ms`), `payload_kb`, the DB query count of
-each phase, and a `lazy_loads` map of every relation that resolved on demand:
+each phase, a `slow_query` map naming the slowest statement each phase ran, and a
+`lazy_loads` map of every relation that resolved on demand:
 
 ```
 php artisan scout:import "App\Models\Product" --parallel --profile-samples=all
@@ -610,6 +611,67 @@ first worker picking up work, and they are usually all you need: a non-empty
 `lazy_loads` map naming `App\Models\Product::category` is an N+1, and the fix is
 to eager-load that relation in `makeAllSearchableUsing`. You do not have to wait
 for the run to finish to read its diagnosis.
+
+##### Which query is slow (`slow_query`)
+
+A query count tells you **how many**, never **which one**. A real run on a
+4728-chunk users table reported `Fetch ms 258439.8` and `Queries 5/0/0` per
+1000-row chunk: five statements, one of them responsible for four minutes, and
+nothing saying which of the five to go and look at. Worse, two chunks in
+completely different id ranges came within 0.4% of each other — a cost that does
+not vary with which slice you ask for, which is what a full scan looks like from
+the outside.
+
+So every profiled chunk also records the **slowest statement of each phase**,
+alongside the counts it already reported:
+
+```
+'queries'    => ['fetch' => 5, 'filter' => 0, 'index' => 0],
+'slow_query' => [
+    'fetch'  => ['sql' => 'select * from "users" where "users"."id" > ? and "users"."id" <= ? order by "users"."id" asc', 'ms' => 258201.4],
+    'filter' => null,
+    'index'  => null,
+],
+```
+
+A phase reports `null` exactly when it issued no query at all — a
+`shouldBeSearchable()` that decides from already-loaded attributes, an empty
+chunk — so a `null` is a healthy answer, not a missing measurement.
+
+**Bound values are never captured. Ever.** The `sql` is the statement as Laravel
+logs it, with `?` placeholders; the bindings that go with it hold real row data —
+emails, names, API tokens — and are never read, never stored and never printed.
+That is not incidental: this string travels into your application logs and into
+the Redis run record, neither of which redacts anything, and both of which people
+paste into tickets. Nothing from a row can reach either through this feature, and
+every surface that prints the SQL says so on the line.
+
+**It is free.** A profiled chunk was already enabling the query log, counting its
+entries and throwing the whole thing away; keeping the slowest entry is one pass
+over an array that is already in memory. And the query log is only ever enabled on
+a profiled chunk, so an unprofiled chunk — the overwhelming majority on
+`--profile-samples=N` — pays exactly nothing, as before.
+
+Two things happen to the SQL before it is published, in this order:
+
+- **Placeholder runs are collapsed.** An eager load over a 1000-row chunk logs
+  `where "id" in (?, ?, ?, … ×1000)` — kilobytes of nothing. A run of three or
+  more comma-separated placeholders becomes a marker naming the count, so
+  `select "categories".* from "categories" where "categories"."id" in (?×1000)`
+  is what you get: shorter, and still saying it was a 1000-key `IN`, which is a
+  finding in itself.
+- **Then it is truncated**, to ~300 characters in the log line (~200 in a
+  finding, which is JSON-encoded into the run record and printed on a terminal),
+  with a trailing `...`. Newlines and runs of whitespace collapse to single
+  spaces, so one query stays one log line. Collapsing first is the whole point of
+  the order: truncating first would hand you a wall of question marks and cut off
+  the tables and joins that are the entire diagnostic value.
+
+The statement shows up on every surface the profiling numbers already reach: the
+`scout:import chunk profile` log line above, under a
+[`--wait` finding](#findings-on-your-terminal---profile-samples-with---wait) that
+raises the question, and in a dedicated block of the
+[`--probe` output](#probing-before-you-commit-to-a-full-import---probe).
 
 ##### Sampling with `--profile-samples`
 
@@ -707,6 +769,7 @@ Preparing [App\Models\Product]: Planning chunks…
 [App\Models\Product] import running: 6/1042 chunks done.
 Fetching dominates [App\Models\Product]: 8410.2 ms of 11204.7 ms (75.1%) went to reading rows from the database.
   Index the columns the keyset scan and eager-loads sort/join on, drop with() relations the index does not need, and try --fast-plan; a smaller --chunk will not help while the read is the bottleneck.
+    Slowest query in that phase: 8121.7 ms — select * from "products" inner join "shops" on "shops"."id" = "products"."shop_id" where "products"."id" > ? and "products"."id" <= ? and "products"."deleted_at" is null order by "products"."id" asc (statement only: `?` placeholders, no bound values are ever captured)
 N+1 while indexing [App\Models\Product]: App\Models\Product::category was lazy-loaded 500 times inside one chunk (2 relation(s) lazy-loaded).
   Each of those 500 loads is an extra query per model: eager-load the relation in makeAllSearchableUsing() on the model, e.g. `return $query->with([...]);`.
 [App\Models\Product] import running: 11/1042 chunks done.
@@ -725,6 +788,15 @@ The `chunk_near_timeout` above was published between the last poll and the
 terminal transition, so it never got an inline line — which is why the roll-up
 repeats its remedy (indented) for that code and only that code. A late finding is
 never reported without its fix.
+
+The extra indented line under `fetch_dominant` is
+[the slowest query](#which-query-is-slow-slow_query) of the phase the finding is
+about. Those two findings — `fetch_dominant` and `index_dominant` — are the ones
+whose very next question is "which query?", so they carry the answer with them; no
+other finding does, and no finding sentence got longer to make room for it. That
+line turns "the read owns 75% of the chunk" into a statement you can paste
+straight into `EXPLAIN`, and it is the statement only: `?` placeholders, no bound
+values, so nothing from a row is in your terminal or in the run record.
 
 What each finding means:
 
@@ -829,11 +901,23 @@ Probe findings for [App\Models\Product] (3 distinct — diagnostics only, --prob
     Index the columns the keyset scan and eager-loads sort/join on, drop with() relations the index does not need, and try --fast-plan; a smaller --chunk will not help while the read is the bottleneck.
   5 of 5 sampled chunk(s): A chunk of [App\Models\Product] took 118904.1 ms, at or past its 60 s job timeout (198.2% of the budget) — that chunk is being killed mid-flight.
     Raise SCOUT_QUEUE_TIMEOUT above your p99 chunk (and keep the queue VisibilityTimeout above that), or lower --chunk until a chunk finishes well inside the timeout.
+Slowest query per phase across the sampled chunks of [App\Models\Product] — paste each into EXPLAIN. A cost that barely changes between chunks in different id ranges is a full scan, i.e. a missing index. Statement only: `?` placeholders, no bound values are ever captured, so nothing below carries row data.
+  Fetch, 99460.8 ms (chunk 6688):
+    select * from "products" inner join "shops" on "shops"."id" = "products"."shop_id" where "products"."id" > ? and "products"."id" <= ? and "products"."deleted_at" is null order by "products"."id" asc
 Probe index [products_probe_1754899200_k3f9qa] deleted. Nothing else was created and no import ran.
 ```
 
 That is the whole diagnosis, in the time five chunks take: the `502` queries per
-chunk against 500 rows is the N+1, and the fetch phase is where the time goes.
+chunk against 500 rows is the N+1, and the fetch phase is where the time goes —
+and the block under the findings says **which** of those 502 statements the time
+went into, on a line of its own so you can select it and run `EXPLAIN` on it. It
+reports the worst statement seen per phase across every sampled chunk, in
+fetch/filter/index order, skipping any phase that issued no query (here: filter
+and index), and it is printed whether or not a finding fired, because a fetch that
+is merely 55% of the chunk is under the dominance threshold and still worth a look.
+It is [the same capture](#which-query-is-slow-slow_query) the log line uses, with
+the same guarantee: `?` placeholders, never the values bound to them.
+
 The findings are the **same** ones a `--profile-samples` import with `--wait`
 prints, rendered from the same `profile_finding_<code>` sentences and remedies —
 a diagnosis reads

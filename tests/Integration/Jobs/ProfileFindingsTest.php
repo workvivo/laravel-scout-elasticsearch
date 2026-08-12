@@ -7,6 +7,7 @@ namespace Tests\Integration\Jobs;
 use App\Product;
 use Illuminate\Console\Command;
 use Illuminate\Console\OutputStyle;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\Artisan;
@@ -65,6 +66,14 @@ final class ProfileFindingsTest extends IntegrationTestCase
     private const PRODUCTS = 5;
 
     private const CHUNKS = 2;
+
+    /**
+     * A value that only ever exists as a QUERY BINDING, never as SQL: the
+     * per-row custom_key the self-join relation is bound to. Any captured
+     * statement containing it means bindings leaked into a log line and into the
+     * run record, which is the one thing this feature may not do.
+     */
+    private const BINDING_SENTINEL = 'binding-sentinel-uuid';
 
     /** @var array<int, array{message: string, context: array<string, mixed>}> */
     private array $logged = [];
@@ -416,6 +425,291 @@ final class ProfileFindingsTest extends IntegrationTestCase
         $this->assertStringNotContainsString('scout::import.', $text);
     }
 
+    /**
+     * @test
+     */
+    public function a_profiled_chunk_logs_the_slowest_query_of_each_phase(): void
+    {
+        // The capture end of the feature, end to end against a real database.
+        // `queries: 5` tells an operator that the fetch ran five statements and
+        // nothing about WHICH of them burned 258 seconds — the query log already
+        // carried both the SQL and its duration and threw them away. This asserts
+        // they now survive into the one place a worker can publish anything: the
+        // `scout:import chunk profile` log line.
+        Bus::fake();
+
+        $store = $this->probeableStore();
+        $this->recordLogs();
+        $this->productsWithSentinelKeys(self::PRODUCTS);
+
+        $source = $this->source();
+        $index = Index::fromSource($source);
+        $store->start(self::TOKEN, self::CHUNKS, $index->name());
+
+        $this->chunkJob($source, $index, 0, true)->handle($this->elasticsearch);
+
+        $context = $this->profileLogContext();
+
+        $this->assertArrayHasKey(
+            'slow_query',
+            $context,
+            'A profiled chunk must publish the slowest statement of each phase, not only a query count.'
+        );
+
+        $slow = $context['slow_query'];
+        $this->assertSame(
+            ['fetch', 'filter', 'index'],
+            array_keys($slow),
+            'The phases are published in the order they run: every renderer iterates these keys.'
+        );
+
+        // The contract is a biconditional — a phase reports null exactly when it
+        // issued no query — so it is asserted as one, against the counts sitting
+        // right next to it in the same log line.
+        foreach (['fetch', 'filter', 'index'] as $phase) {
+            if ($context['queries'][$phase] === 0) {
+                $this->assertNull($slow[$phase], "The $phase phase ran no query, so it has no slowest one.");
+
+                continue;
+            }
+
+            $this->assertIsArray($slow[$phase], "The $phase phase ran a query, so its slowest one must be reported.");
+            $this->assertSame(
+                ['sql', 'ms'],
+                array_keys($slow[$phase]),
+                'A captured entry is the statement and its duration and NOTHING else — in particular no bindings.'
+            );
+            $this->assertIsFloat($slow[$phase]['ms']);
+            $this->assertGreaterThanOrEqual(0.0, $slow[$phase]['ms']);
+            $this->assertStringNotContainsString(
+                "\n",
+                $slow[$phase]['sql'],
+                'Whitespace is normalised so one query stays one log line.'
+            );
+        }
+
+        // The fetch is the phase the whole feature was built for, and it is real
+        // SQL from the real keyset chunk query, not a placeholder or a label.
+        $fetch = $slow['fetch'];
+        $this->assertIsArray($fetch);
+        $this->assertStringContainsString('select', $fetch['sql']);
+        $this->assertStringContainsString('products', $fetch['sql']);
+        $this->assertStringContainsString('?', $fetch['sql'], 'The statement keeps its `?` placeholders.');
+
+        // shouldBeSearchable() decides from an attribute that is already loaded,
+        // which is the healthy shape — and therefore the null case.
+        $this->assertSame(0, $context['queries']['filter']);
+        $this->assertNull($slow['filter']);
+
+        // The index phase resolved LazyProduct::variants once per model, so its
+        // slowest statement is that lazy load: a parameterised self-join on
+        // custom_key whose BINDING IS THE SENTINEL VALUE seeded above.
+        $indexSlow = $slow['index'];
+        $this->assertIsArray($indexSlow);
+        $this->assertStringContainsString('custom_key', $indexSlow['sql']);
+        $this->assertStringContainsString('?', $indexSlow['sql']);
+
+        // PRIVACY, the requirement this feature is constrained by: the statement
+        // travels into application logs and into the Redis run record, so it may
+        // carry `?` and never the value behind it. The assertion is not vacuous —
+        // the index-phase statement asserted just above is exactly the query whose
+        // binding was self::BINDING_SENTINEL.
+        $encoded = (string) json_encode($slow);
+        $this->assertStringNotContainsString(
+            self::BINDING_SENTINEL,
+            $encoded,
+            'A BOUND VALUE REACHED THE OUTPUT. Bindings are row data (emails, names, tokens) and must never be captured.'
+        );
+        $this->assertStringNotContainsString(
+            'bindings',
+            $encoded,
+            'The bindings array must not be carried along even under its own key.'
+        );
+
+        // And none of it changed what the chunk did.
+        $this->assertTrue($store->isDone(self::TOKEN, 0));
+        $this->assertSame(3, $this->indexedCount('products'));
+    }
+
+    /**
+     * @test
+     */
+    public function a_captured_statement_collapses_its_placeholder_runs_and_still_names_the_query(): void
+    {
+        // The reason capture normalises before truncating. An eager load over a
+        // 1000-row chunk logs `in (?, ?, ?, … x1000)` — several kilobytes of
+        // nothing — and a naive truncation would hand the operator a wall of
+        // question marks with the tables and joins, the entire diagnostic value,
+        // cut off the end.
+        //
+        // EagerProduct makes this deterministic without depending on which of the
+        // fetch phase's two statements happened to be slower on this machine:
+        // BOTH carry a collapsible run (the base query's `not in (?, ?, ?, ?)`
+        // guard, the eager load's `in (?, ?, ?)`), so whichever was picked has to
+        // come back collapsed.
+        Bus::fake();
+
+        $store = $this->probeableStore();
+        $this->recordLogs();
+        $this->productsWithSentinelKeys(self::PRODUCTS);
+
+        $source = app(ImportSourceFactory::class)::from(EagerProduct::class);
+        $index = Index::fromSource($source);
+        $store->start(self::TOKEN, self::CHUNKS, $index->name());
+
+        $this->chunkJob($source, $index, 0, true)->handle($this->elasticsearch);
+
+        $context = $this->profileLogContext();
+        $fetch = $context['slow_query']['fetch'];
+
+        $this->assertSame(
+            2,
+            $context['queries']['fetch'],
+            'The fetch ran the base select plus the eager load, so a placeholder run really was logged.'
+        );
+        $this->assertIsArray($fetch);
+
+        // The marker names the count, so a 1000-key IN is still recognisable as
+        // one — itself a finding — instead of being flattened to "an IN".
+        $this->assertMatchesRegularExpression(
+            '/in \(\?×(3|4)\)/u',
+            $fetch['sql'],
+            'A placeholder run must collapse to a marker naming how many placeholders it had.'
+        );
+        $this->assertSame(
+            0,
+            preg_match('/\?(?:\s*,\s*\?){2,}/', $fetch['sql']),
+            'No uncollapsed run may survive into the output: that is what eats the truncation budget.'
+        );
+
+        // Collapsing shortens the statement without costing it its identity: the
+        // verb and the table an operator needs for EXPLAIN are still there.
+        $this->assertStringContainsString('select', $fetch['sql']);
+        $this->assertStringContainsString('products', $fetch['sql']);
+        $this->assertLessThanOrEqual(
+            PullFromSource::SLOW_QUERY_SQL_CHARS + 3,
+            mb_strlen($fetch['sql']),
+            'Capture is bounded: the budget plus the ellipsis.'
+        );
+
+        // The eager load's `in (...)` was bound to the three sentinel custom_keys
+        // of this chunk. Not one of them may appear anywhere in the captured
+        // statement — the marker replaced the placeholders, it did not expand them.
+        $this->assertStringNotContainsString(
+            self::BINDING_SENTINEL,
+            (string) json_encode($context['slow_query']),
+            'A BOUND VALUE REACHED THE OUTPUT. Collapsing a placeholder run must never reveal what was bound to it.'
+        );
+
+        // Nothing lazy-loaded, because the relation is eager-loaded, so the index
+        // phase issued no query at all — the null half of the contract.
+        $this->assertSame(0, $context['queries']['index']);
+        $this->assertNull($context['slow_query']['index']);
+
+        $this->assertTrue($store->isDone(self::TOKEN, 0));
+        $this->assertSame(3, $this->indexedCount('products'));
+    }
+
+    /**
+     * @test
+     */
+    public function the_wait_terminal_prints_the_slowest_query_under_the_finding_that_carries_one(): void
+    {
+        // The other end of the pipe: a fetch_dominant finding published by a
+        // worker has to reach the operator's terminal AS A QUERY, under the remedy
+        // it belongs to. This is the line that turns "the read is slow" into a
+        // statement and a missing index.
+        //
+        // Seeded by hand for the same reason as the inline-rendering test above:
+        // the sync driver has finished every job before --wait polls, and timing
+        // findings cannot be provoked deterministically on an unknown machine.
+        $store = $this->probeableStore();
+        $token = 'wait-slow-query-token';
+
+        // Shaped exactly as capture publishes it: one line, `?` placeholders, and
+        // the collapsed-run marker in place of a 1000-key eager load.
+        $sql = 'select * from "users" inner join "accounts" on "accounts"."id" = "users"."account_id" '
+            .'where "users"."id" in (?×1000) order by "users"."id" asc';
+
+        $store->start($token, 4, 'products_20240101');
+        $store->recordProfileFinding(
+            $token,
+            ProfileDiagnostics::CODE_FETCH_DOMINANT,
+            258439.8,
+            (string) json_encode([
+                'fetch_ms' => 258439.8,
+                'total_ms' => 258710.8,
+                'pct' => 99.9,
+                'slow_sql' => $sql,
+                'slow_ms' => 258439.8,
+            ]),
+            900,
+            20
+        );
+        // A second finding that carries NO query, so the extra line can be shown
+        // to belong to the finding that has one rather than to every finding.
+        $store->recordProfileFinding(
+            $token,
+            ProfileDiagnostics::CODE_N_PLUS_ONE,
+            480.0,
+            (string) json_encode(['relation' => 'App\\Order::user', 'loads' => 480, 'relations' => 2]),
+            900,
+            20
+        );
+        $store->scriptStatuses(ImportRunStore::STATUS_RUNNING, ImportRunStore::STATUS_SUCCEEDED);
+
+        $buffer = new BufferedOutput();
+        $command = $this->commandWithOptions(['--profile-samples' => 'all'], $buffer);
+
+        $waitForRun = new ReflectionMethod(ImportCommand::class, 'waitForRun');
+        $waitForRun->setAccessible(true);
+        $exitCode = $waitForRun->invoke($command, 'App\Order', $token, 'redis', 'reindex');
+
+        $this->assertSame(
+            ImportCommand::SUCCESS,
+            $exitCode,
+            'Naming the query is a diagnostic like any other: it cannot change the exit code.'
+        );
+
+        $text = $buffer->fetch();
+
+        // The duration, and the statement itself verbatim on the line so it can be
+        // selected and pasted straight into EXPLAIN — marker included.
+        $this->assertStringContainsString('Slowest query in that phase: 258439.8 ms', $text);
+        $this->assertStringContainsString($sql, $text);
+        $this->assertStringContainsString('in (?×1000)', $text);
+
+        // Said out loud where the operator copying it can read it.
+        $this->assertStringContainsString('no bound values are ever captured', $text);
+
+        // Under the remedy of its own finding, not above it and not instead of it:
+        // the existing sentences are unchanged and this is an extra line.
+        $this->assertStringContainsString('Fetching dominates [App\Order]', $text);
+        $this->assertLessThan(
+            (int) strpos($text, 'Slowest query in that phase'),
+            (int) strpos($text, 'Index the columns the keyset scan'),
+            'The query belongs under the remedy it explains.'
+        );
+
+        // Exactly once: printed when the code first appears, and not repeated by
+        // the closing roll-up — and not attached to the n+1 finding, which carries
+        // no statement.
+        $this->assertSame(
+            1,
+            substr_count($text, 'Slowest query in that phase'),
+            'Only a finding that carries a statement gets the line, and only on its first appearance.'
+        );
+        $this->assertStringContainsString('N+1 while indexing [App\Order]', $text);
+
+        // Rendered through the translations like every other finding line, so
+        // neither a raw key nor an unreplaced placeholder may reach the terminal —
+        // including the short spellings the shared sentence reads.
+        $this->assertStringNotContainsString('scout::import.', $text);
+        $this->assertStringNotContainsString(':sql', $text);
+        $this->assertStringNotContainsString(':ms ', $text);
+        $this->assertStringNotContainsString(':slow_sql', $text);
+    }
+
     // ---- harness -----------------------------------------------------------
 
     /**
@@ -508,6 +802,48 @@ final class ProfileFindingsTest extends IntegrationTestCase
         factory(Product::class, $amount)->create();
 
         Product::setEventDispatcher($dispatcher);
+    }
+
+    /**
+     * The same rows {@see products} creates, except that custom_key — the column
+     * the lazy-loaded relation joins on, and therefore the value bound into every
+     * relation query — is a known sentinel instead of a random uuid.
+     *
+     * That is what makes the privacy assertions non-vacuous: the captured
+     * statement is provably the one this value was bound to, so its absence from
+     * the output is a real property and not an accident of random data.
+     */
+    private function productsWithSentinelKeys(int $amount): void
+    {
+        $dispatcher = Product::getEventDispatcher();
+        Product::unsetEventDispatcher();
+
+        // Unique per row, so each model resolves exactly one cheap row on demand
+        // and the eager load produces one placeholder per model rather than a
+        // deduplicated single key.
+        for ($i = 0; $i < $amount; $i++) {
+            factory(Product::class)->create(['custom_key' => self::BINDING_SENTINEL.'-'.$i]);
+        }
+
+        Product::setEventDispatcher($dispatcher);
+    }
+
+    /**
+     * The structured context of the `scout:import chunk profile` line — the whole
+     * metrics array a profiled chunk publishes, exactly as a worker's log
+     * receives it.
+     *
+     * @return array<string, mixed>
+     */
+    private function profileLogContext(): array
+    {
+        foreach ($this->logged as $line) {
+            if ($line['message'] === 'scout:import chunk profile') {
+                return $line['context'];
+            }
+        }
+
+        $this->fail('A profiled chunk must log `scout:import chunk profile` with its metrics.');
     }
 
     private function indexedCount(string $index): int
@@ -819,6 +1155,63 @@ class LazyProduct extends Product
             // Not eager-loaded anywhere, so reading it here is the violation.
             // Exactly the shape of the real bug: an innocent-looking accessor
             // inside toSearchableArray() that costs one query per model.
+            'variants' => $this->variants->count(),
+        ];
+    }
+}
+
+/**
+ * The HEALTHY counterpart of LazyProduct: the same relation, eager-loaded the way
+ * the n+1 remedy tells you to.
+ *
+ * It exists to make placeholder collapsing deterministic. An eager load is what
+ * produces the `where "custom_key" in (?, ?, ?, …)` that motivates collapsing in
+ * the first place, and its two fetch-phase statements are deliberately BOTH
+ * collapsible:
+ *
+ *  - the base select carries a `not in (?, ?, ?, ?)` guard (see
+ *    makeAllSearchableUsing below), and
+ *  - the eager load carries `in (?, ?, ?)`, one placeholder per model in the
+ *    chunk.
+ *
+ * So the test never has to guess which of the two the machine timed as slower —
+ * either answer must come back with a collapsed marker. The guard is written to
+ * exclude nothing: the titles are faker sentences, so no real row can match those
+ * four sentinels, and the fetched set is identical to Product's.
+ */
+class EagerProduct extends Product
+{
+    protected $table = 'products';
+
+    /**
+     * @return HasMany<Product>
+     */
+    public function variants(): HasMany
+    {
+        return $this->hasMany(Product::class, 'custom_key', 'custom_key');
+    }
+
+    /**
+     * @param  Builder<Product>  $query
+     * @return Builder<Product>
+     */
+    protected function makeAllSearchableUsing(Builder $query)
+    {
+        return $query
+            ->with('variants')
+            ->whereNotIn('title', ['no-such-title-1', 'no-such-title-2', 'no-such-title-3', 'no-such-title-4']);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function toSearchableArray(): array
+    {
+        return [
+            'title' => $this->title,
+            // Already loaded by the eager load above, so this costs no query —
+            // which is also why the index phase of this model reports no slowest
+            // statement at all.
             'variants' => $this->variants->count(),
         ];
     }

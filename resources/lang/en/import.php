@@ -52,6 +52,18 @@ return [
     'profile_finding_large_payload' => 'Large documents in [:searchable]: :avg_kb KB average across :indexed documents (:payload_kb KB in one chunk).',
     'profile_finding_large_payload_hint' => 'Trim toSearchableArray() — whole relations, blobs and casts are the usual leaks — or lower --chunk so each bulk request stays small.',
 
+    // Shared by --wait and --probe, printed under the remedy of the two findings
+    // that make an operator ask "which query?" (fetch_dominant, index_dominant):
+    // the slowest statement that phase actually ran, straight from the query log
+    // the profiled chunk already collected.
+    //
+    // PRIVACY: this is the STATEMENT ONLY, with `?` placeholders. The bindings —
+    // real row data: emails, names, tokens — are never captured, never stored in
+    // the run record and never rendered, here or anywhere else. Say so on the
+    // line itself: this SQL is copied into tickets and EXPLAIN, and the operator
+    // pasting it deserves to know it carries no customer data.
+    'profile_finding_slow_query' => 'Slowest query in that phase: :ms ms — :sql (statement only: `?` placeholders, no bound values are ever captured)',
+
     // --- --probe (ImportProbe) -----------------------------------------------
     // Chrome only. The findings a probe prints are the SAME diagnoses a --wait run
     // prints, rendered from the profile_finding_<code> / _hint keys above — there
@@ -79,6 +91,17 @@ return [
     'probe_aggregates' => 'Measured :measured chunk(s) of [:searchable]: min :min_ms ms, median :median_ms ms, mean :mean_ms ms, max :max_ms ms (:fetched rows fetched, :indexed indexed).',
     'probe_estimate' => 'ESTIMATE from :measured sampled chunk(s), not a measurement: :chunks chunks x :mean_s s mean = :serial on one worker, :parallel across :workers worker(s). Chunk cost is never uniform, so a heavy tail pushes this up.',
     'probe_estimate_overhead' => 'The :mean_s s mean excludes :overhead_s s per chunk of profiling overhead (measured mean was :measured_mean_s s): profiling serializes every document one extra time to separate serialize_ms from bulk_ms, and an import never pays that.',
+    // The block that turns "the read is slow" into a query and a missing index.
+    // The probe already logs one query per phase per sampled chunk; this reports
+    // the worst of them, per phase, so the operator has something to paste into
+    // EXPLAIN instead of a query count. Same privacy rule as above and stated
+    // again here, because this block is the one people copy out of the terminal:
+    // the SQL is the statement with `?` placeholders and nothing else.
+    'probe_slow_queries_header' => 'Slowest query per phase across the sampled chunks of [:searchable] — paste each into EXPLAIN. A cost that barely changes between chunks in different id ranges is a full scan, i.e. a missing index. Statement only: `?` placeholders, no bound values are ever captured, so nothing below carries row data.',
+    'probe_slow_query' => ':phase, :ms ms (chunk :chunk):',
+    'probe_slow_query_phase_fetch' => 'Fetch',
+    'probe_slow_query_phase_filter' => 'Filter',
+    'probe_slow_query_phase_index' => 'Index',
     'probe_findings_header' => 'Probe findings for [:searchable] (:findings distinct — diagnostics only, --probe exits successfully either way):',
     'probe_finding_occurrences' => ':count of :sampled sampled chunk(s): :message',
     'probe_no_findings' => 'No findings for [:searchable]: nothing in the sampled chunks looks pathological.',
