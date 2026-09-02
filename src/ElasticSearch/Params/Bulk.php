@@ -18,6 +18,20 @@ final class Bulk
     private $deleteDocs = [];
 
     /**
+     * The index every action in this payload targets, or null to keep using each
+     * model's own `searchableAs()` — which is the ALIAS, and therefore the live
+     * index the application reads from.
+     *
+     * Overriding it is how a caller writes documents somewhere the alias does not
+     * point (the --probe throwaway index). It has to be a property rather than an
+     * argument to {@see toArray} because the payload is assembled by two reduce
+     * closures over models, and the model is what would otherwise decide.
+     *
+     * @var string|null
+     */
+    private $index = null;
+
+    /**
      * @param  array|object  $docs
      */
     public function delete($docs): void
@@ -32,8 +46,22 @@ final class Bulk
     }
 
     /**
-     * TODO: Add ability to extend payload without modifying the class.
+     * Send every action in this payload to $index instead of the model's alias.
      *
+     * Passing null restores the default, so `into(null)` is indistinguishable
+     * from never having called it — the payload is byte-identical.
+     *
+     * @param  string|null  $index
+     * @return $this
+     */
+    public function into(?string $index): self
+    {
+        $this->index = $index;
+
+        return $this;
+    }
+
+    /**
      * @return array
      */
     public function toArray(): array
@@ -51,7 +79,7 @@ final class Bulk
 
                 $payload['body'][] = [
                     'index' => [
-                        '_index' => $model->searchableAs(),
+                        '_index' => $this->index ?? $model->searchableAs(),
                         '_id' => $scoutKey,
                         'routing' => false === empty($routing) ? $routing : $scoutKey,
                     ],
@@ -76,7 +104,7 @@ final class Bulk
 
                 $payload['body'][] = [
                     'delete' => [
-                        '_index' => $model->searchableAs(),
+                        '_index' => $this->index ?? $model->searchableAs(),
                         '_id' => $scoutKey,
                         'routing' => false === empty($routing) ? $routing : $scoutKey,
                     ],

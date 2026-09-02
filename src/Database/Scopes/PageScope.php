@@ -5,8 +5,14 @@ namespace Matchish\ScoutElasticSearch\Database\Scopes;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Scope;
-use Illuminate\Support\Facades\Cache;
 
+/**
+ * Offset-based page scope. No longer used by the import pipeline, which seeks
+ * by key range (see {@see \Matchish\ScoutElasticSearch\Database\Scopes\ChunkScope}).
+ * Kept for backwards compatibility only.
+ *
+ * @internal
+ */
 class PageScope implements Scope
 {
     /**
@@ -33,25 +39,12 @@ class PageScope implements Scope
     /**
      * Apply the scope to a given Eloquent query builder.
      *
-     * @param  Builder  $builder
+     * @param  Builder<Model>  $builder
      * @param  Model  $model
      * @return void
      */
     public function apply(Builder $builder, Model $model)
     {
-        $keyName = $model->getKeyName();
-
-        if ($keyName === 'id') {
-            // Keyset pagination on `id` requires `id` to be the only ORDER BY.
-            // forPageAfterId clears existing orders for `id` but leaves other
-            // orderings in place, so any competing ORDER BY (e.g. from a model
-            // global scope or makeAllSearchableUsing) would become the primary
-            // sort and cause chunks to skip or duplicate rows. reorder() drops
-            // them all before forPageAfterId sets its own.
-            $builder->reorder();
-            $builder->forPageAfterId($this->perPage, Cache::get('scout_import_last_id', 0), $model->getTable().'.id');
-        } else {
-            $builder->forPage($this->page, $this->perPage);
-        }
+        $builder->forPage($this->page, $this->perPage);
     }
 }

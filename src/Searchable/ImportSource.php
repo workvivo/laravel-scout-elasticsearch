@@ -13,7 +13,13 @@ interface ImportSource
 
     public function searchableAs(): string;
 
+    /**
+     * @return Collection<int, ImportSource>
+     */
     public function chunked(): Collection;
 
+    /**
+     * @return EloquentCollection<int, \Illuminate\Database\Eloquent\Model>
+     */
     public function get(): EloquentCollection;
 }

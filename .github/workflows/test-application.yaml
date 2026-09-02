@@ -39,6 +39,11 @@ jobs:
                 ports:
                     - 3306:3306
                 options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+            redis:
+                image: redis:7-alpine
+                ports:
+                    - 6379:6379
+                options: --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=5
 
         steps:
             -   name: Checkout project
@@ -75,3 +80,41 @@ jobs:
                     DB_DATABASE: unittest
                     DB_USERNAME: root
                     ELASTICSEARCH_HOST: '127.0.0.1:9200'
+                    REDIS_CLIENT: predis
+                    REDIS_HOST: '127.0.0.1'
+                    REDIS_PORT: 6379
+
+    docker:
+        name: Run Docker Compose tests
+        runs-on: ubuntu-latest
+
+        env:
+            APP_ENV: testing
+            TIMEZONE: UTC
+            OPENSEARCH_VERSION: 2.19.3
+            ELASTICSEARCH_HOST: http://opensearch:9200
+            ELASTICSEARCH_USER: ''
+            ELASTICSEARCH_PASSWORD: ''
+            DB_HOST: db
+            DB_PORT: 3306
+            DB_DATABASE: my_database
+            DB_USERNAME: root
+            DB_PASSWORD: YourStrongPassword1!
+            XDEBUG_CONFIG: client_port=9005 client_host=host.docker.internal mode=debug start_with_request=yes log=/home/user/xdebug.log
+            PHP_IDE_CONFIG: serverName=Scout
+
+        steps:
+            -   name: Checkout project
+                uses: actions/checkout@v4
+
+            -   name: Configure OpenSearch host limits
+                run: sudo sysctl -w vm.max_map_count=262144
+
+            -   name: Configure Docker user
+                run: echo "APP_USER=$(id -u):$(id -g)" >> "$GITHUB_ENV"
+
+            -   name: Install dependencies
+                run: make install DOCKER_EXEC_USER="$APP_USER"
+
+            -   name: Run tests
+                run: make test

@@ -1,0 +1,385 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Tests\Feature;
+
+use App\Product;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
+use Matchish\ScoutElasticSearch\Console\Commands\ImportCommand;
+use Matchish\ScoutElasticSearch\Jobs\DispatchPullChunks;
+use Matchish\ScoutElasticSearch\Jobs\PullChunkJob;
+use Matchish\ScoutElasticSearch\Jobs\StageJob;
+use stdClass;
+use Symfony\Component\Console\Output\BufferedOutput;
+use Tests\IntegrationTestCase;
+
+final class ParallelImportCommandTest extends IntegrationTestCase
+{
+    /**
+     * Route Scout imports through the sync connection. Sync executes queued
+     * jobs inline, so parallel imports run end-to-end in the test process — but
+     * because it is the sync driver, --parallel needs --force to proceed.
+     */
+    private function useSyncQueue(): void
+    {
+        $this->app['config']->set('scout.queue', ['connection' => 'sync', 'queue' => 'scout']);
+    }
+
+    /**
+     * scout.queue disabled, but the app's default queue is an asynchronous
+     * connection — the real-world setup where --parallel should just work.
+     */
+    private function useAsyncDefaultQueue(): void
+    {
+        $this->app['config']->set('scout.queue', false);
+        $this->app['config']->set('queue.connections.async_test', [
+            'driver' => 'database',
+            'table' => 'jobs',
+            'queue' => 'default',
+        ]);
+        $this->app['config']->set('queue.default', 'async_test');
+    }
+
+    private function withoutModelEvents(string $class, callable $callback): void
+    {
+        $dispatcher = $class::getEventDispatcher();
+        $class::unsetEventDispatcher();
+        $callback();
+        $class::setEventDispatcher($dispatcher);
+    }
+
+    private function searchTotal(string $index): int
+    {
+        $response = $this->elasticsearch->search([
+            'index' => $index,
+            'body' => ['query' => ['match_all' => new stdClass()]],
+        ]);
+
+        return $response['hits']['total']['value'];
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_imports_all_records_across_multiple_chunks(): void
+    {
+        $this->useSyncQueue();
+
+        // Chunk size is 3 (see TestCase), so 10 rows fan out into 4 chunks that
+        // each run as its own chunk job.
+        $productsAmount = 10;
+        $this->withoutModelEvents(Product::class, function () use ($productsAmount) {
+            factory(Product::class, $productsAmount)->create();
+        });
+
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
+
+        $this->assertEquals($productsAmount, $this->searchTotal((new Product())->searchableAs()));
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_imports_all_discovered_models_when_none_is_specified(): void
+    {
+        $this->useSyncQueue();
+
+        $productsAmount = 7; // chunk size 3 => 3 chunks
+        $this->withoutModelEvents(Product::class, function () use ($productsAmount) {
+            factory(Product::class, $productsAmount)->create();
+        });
+
+        // No searchable argument: the command discovers and imports every model.
+        Artisan::call('scout:import', ['--parallel' => true, '--force' => true]);
+
+        $this->assertEquals($productsAmount, $this->searchTotal((new Product())->searchableAs()));
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_errors_when_the_resolved_connection_is_sync(): void
+    {
+        Bus::fake();
+
+        // scout.queue disabled and the default queue is the sync driver: there
+        // is no real parallelism to be had, so it fails fast rather than
+        // silently running serially.
+        $this->app['config']->set('scout.queue', false);
+        $this->app['config']->set('queue.default', 'sync');
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+
+        $this->assertEquals(ImportCommand::FAILURE, $exitCode);
+        Bus::assertNothingDispatched();
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_errors_when_the_import_lock_store_is_file(): void
+    {
+        Bus::fake();
+        $this->useAsyncDefaultQueue();
+        $this->app['config']->set('cache.default', 'file');
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+
+        $this->assertEquals(ImportCommand::FAILURE, $exitCode);
+        Bus::assertNothingDispatched();
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_works_without_scout_queue_on_an_async_default_connection(): void
+    {
+        $this->useAsyncDefaultQueue();
+        Bus::fake();
+
+        // No --force, no scout.queue: it should dispatch onto the app default.
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true]);
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        Bus::assertChained([
+            StageJob::class,
+            StageJob::class,
+            DispatchPullChunks::class,
+        ]);
+    }
+
+    /**
+     * @test
+     */
+    public function force_runs_parallel_inline_on_a_sync_connection(): void
+    {
+        // scout.queue disabled and sync default — --force runs it inline anyway.
+        $this->app['config']->set('scout.queue', false);
+        $this->app['config']->set('queue.default', 'sync');
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 5)->create();
+        });
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertEquals(5, $this->searchTotal((new Product())->searchableAs()));
+    }
+
+    /**
+     * @test
+     */
+    public function chunk_option_changes_the_number_of_chunk_jobs(): void
+    {
+        Bus::fake();
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 10)->create();
+        });
+
+        $source = app(\Matchish\ScoutElasticSearch\Searchable\ImportSourceFactory::class)::from(Product::class)
+            ->withChunkSize(10);
+        $index = \Matchish\ScoutElasticSearch\ElasticSearch\Index::fromSource($source);
+
+        // 10 rows, chunk size 10 => a single chunk (vs 4 at the config default 3).
+        (new DispatchPullChunks($source, $index, 'redis', 'reindex', null))->handle();
+
+        Bus::assertDispatched(PullChunkJob::class, 1);
+    }
+
+    /**
+     * @test
+     */
+    public function invalid_chunk_option_fails_fast(): void
+    {
+        Bus::fake();
+
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--chunk' => '0']);
+
+        $this->assertEquals(ImportCommand::FAILURE, $exitCode);
+        Bus::assertNothingDispatched();
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_dispatches_the_prepare_then_fanout_chain(): void
+    {
+        $this->useSyncQueue();
+        Bus::fake();
+
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
+
+        Bus::assertChained([
+            StageJob::class,
+            StageJob::class,
+            DispatchPullChunks::class,
+        ]);
+    }
+
+    /**
+     * @test
+     */
+    public function wait_shows_progress_and_prints_a_summary_with_indexed_count(): void
+    {
+        $this->useSyncQueue();
+
+        $productsAmount = 10; // chunk size 3 => 4 chunks
+        $this->withoutModelEvents(Product::class, function () use ($productsAmount) {
+            factory(Product::class, $productsAmount)->create();
+        });
+
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call(
+            'scout:import',
+            ['searchable' => [Product::class], '--parallel' => true, '--force' => true, '--wait' => true],
+            $output
+        );
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertEquals($productsAmount, $this->searchTotal((new Product())->searchableAs()));
+
+        // Summary reports the indexed count and the chunk total, not "dispatched".
+        $text = $output->fetch();
+        $this->assertStringContainsString('10 documents', $text);
+        $this->assertStringContainsString('4 chunks', $text);
+    }
+
+    /**
+     * @test
+     */
+    public function wait_on_an_empty_model_reports_nothing_to_import(): void
+    {
+        $this->useSyncQueue();
+
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call(
+            'scout:import',
+            ['searchable' => [Product::class], '--parallel' => true, '--force' => true, '--wait' => true],
+            $output
+        );
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertStringContainsString('no records', $output->fetch());
+    }
+
+    /**
+     * @test
+     */
+    public function wait_without_parallel_warns_and_is_ignored(): void
+    {
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call('scout:import', ['searchable' => [Product::class], '--wait' => true], $output);
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $this->assertStringContainsString('only applies to --parallel', $output->fetch());
+    }
+
+    /**
+     * @test
+     */
+    public function wait_timeout_names_the_resolved_connection_and_queue(): void
+    {
+        // Bus::fake() shelves the chain, so no prepare heartbeat and no run record
+        // ever appear — the "never picked up" branch. wait_timeout=0 makes it
+        // give up on the first poll.
+        $this->useAsyncDefaultQueue();
+        $this->app['config']->set('elasticsearch.import.wait_timeout', 0);
+        Bus::fake();
+
+        $output = new BufferedOutput();
+        $exitCode = Artisan::call(
+            'scout:import',
+            ['searchable' => [Product::class], '--parallel' => true, '--wait' => true, '--queue' => 'reindex'],
+            $output
+        );
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exitCode);
+        $text = $output->fetch();
+
+        // No heartbeat was ever seen, so it reports the "no worker picked it up"
+        // case, naming the resolved connection/queue. Explicit --queue is echoed
+        // verbatim; connection falls through to the resolved app default
+        // (async_test from useAsyncDefaultQueue).
+        $this->assertStringContainsString('no worker started', $text);
+        $this->assertStringContainsString('connection [async_test]', $text);
+        $this->assertStringContainsString('queue [reindex]', $text);
+        $this->assertStringContainsString('SCOUT_IMPORT_WAIT_TIMEOUT', $text);
+    }
+
+    /**
+     * @test
+     */
+    public function wait_reports_a_stalled_prepare_when_the_chain_was_picked_up_then_went_silent(): void
+    {
+        // A heartbeat under the polled token means a worker picked up the chain;
+        // the run record never materialising after that is the "stalled prepare"
+        // case (slow stage, or crashed/OOM worker) — distinct from "no worker".
+        // waitForRun is private and the command mints a random token, so drive
+        // it directly with a token whose heartbeat we seed.
+        $this->app['config']->set('elasticsearch.import.wait_timeout', 0);
+
+        $token = 'stalled-token';
+        Cache::put(
+            DispatchPullChunks::preparingKey($token),
+            ['seq' => 2, 'stage' => 'Create write index'],
+            60
+        );
+
+        $command = new ImportCommand();
+        $command->setLaravel($this->app);
+        $buffer = new BufferedOutput();
+        $outputProp = (new \ReflectionClass(\Illuminate\Console\Command::class))->getProperty('output');
+        $outputProp->setAccessible(true);
+        $outputProp->setValue(
+            $command,
+            new \Illuminate\Console\OutputStyle(new \Symfony\Component\Console\Input\ArrayInput([]), $buffer)
+        );
+
+        $waitForRun = (new \ReflectionClass(ImportCommand::class))->getMethod('waitForRun');
+        $waitForRun->setAccessible(true);
+        $exit = $waitForRun->invoke($command, 'App\Product', $token, 'redis', 'reindex');
+
+        $this->assertEquals(ImportCommand::SUCCESS, $exit);
+        $text = $buffer->fetch();
+
+        // Reports the stalled case, names the stage it was last seen on, and
+        // does NOT fall back to the "no worker picked it up" wording.
+        $this->assertStringContainsString('Create write index', $text);
+        $this->assertStringContainsString('produced no run record', $text);
+        $this->assertStringNotContainsString('no worker started', $text);
+    }
+
+    /**
+     * @test
+     */
+    public function parallel_switches_alias_and_removes_old_index(): void
+    {
+        $this->useSyncQueue();
+
+        // Seed an existing index behind the alias so we can prove the swap.
+        $this->elasticsearch->indices()->create([
+            'index' => 'products_old',
+            'body' => [
+                'aliases' => ['products' => new stdClass()],
+                'settings' => ['number_of_shards' => 1, 'number_of_replicas' => 0],
+            ],
+        ]);
+
+        $this->withoutModelEvents(Product::class, function () {
+            factory(Product::class, 5)->create();
+        });
+
+        Artisan::call('scout:import', ['searchable' => [Product::class], '--parallel' => true, '--force' => true]);
+
+        $this->assertFalse(
+            $this->elasticsearch->indices()->exists(['index' => 'products_old']),
+            'Old index must be removed after the parallel swap'
+        );
+        $this->assertEquals(5, $this->searchTotal((new Product())->searchableAs()));
+    }
+}
